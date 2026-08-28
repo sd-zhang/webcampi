@@ -16,9 +16,15 @@ start() {
 		return 1
 	fi
 
-	start-stop-daemon --start --background --make-pidfile\
-		--pidfile "$PIDFILE" --exec "/usr/bin/$DAEMON" \
-		-- -c 0 uvc.0 -p "23 24 26" $UVC_GADGET_ARGS
+	# Run the daemon backgrounded, but capture its stdout/stderr to a log
+	# readable from the USB ACM shell for UVC Probe/Commit/STREAMON
+	# diagnostics. Functional behaviour is unchanged; only the output
+	# destination differs from the previous start-stop-daemon --background,
+	# which discarded the daemon's output to /dev/null. The daemon runs in
+	# the foreground (no self-daemonize), so $! is its real PID.
+	"/usr/bin/$DAEMON" -c 0 uvc.0 -p "23 24 26" $UVC_GADGET_ARGS \
+		< /dev/null > /tmp/uvc-gadget.log 2>&1 &
+	echo $! > "$PIDFILE"
 	status=$?
 	if [ "$status" -eq 0 ]; then
 		echo "OK"

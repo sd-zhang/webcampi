@@ -1,0 +1,73 @@
+Fix UVC class-request routing for the UVC+ACM composite. The gadget kernel
+normalises the control-transfer wIndex to the fixed UVC string indices
+(UVC_STRING_CONTROL_IDX=0 / UVC_STRING_STREAMING_IDX=1), but this userspace
+routed by comparing against the configfs absolute bInterfaceNumber. With CDC
+ACM linked before UVC, streaming is interface 3, so SET_CUR(VS_PROBE_CONTROL)
+matched neither branch, resp.length stayed negative, and the gadget stalled
+ep0 -- aborting the data stage before UVC_EVENT_DATA. Route on the fixed
+indices (keeping the configfs number as a defensive fallback).
+---
+--- a/lib/uvc.c
++++ b/lib/uvc.c
+@@ -25,6 +25,19 @@
+ #include "uvc.h"
+ #include "v4l2.h"
+ 
++/*
++ * Fixed UVC interface string indices the gadget kernel normalises wIndex to
++ * before delivering control events. Defined by <linux/usb/g_uvc.h> on current
++ * kernels; provide the standard UAPI values as a fallback for older sysroot
++ * headers that predate them.
++ */
++#ifndef UVC_STRING_CONTROL_IDX
++#define UVC_STRING_CONTROL_IDX		0
++#endif
++#ifndef UVC_STRING_STREAMING_IDX
++#define UVC_STRING_STREAMING_IDX	1
++#endif
++
+ struct uvc_device
+ {
+ 	struct v4l2_device *vdev;
+@@ -274,10 +287,39 @@
+ 	if ((ctrl->bRequestType & USB_RECIP_MASK) != USB_RECIP_INTERFACE)
+ 		return;
+ 
+-	if (interface == dev->fc->control.intf.bInterfaceNumber)
++	/*
++	 * The gadget kernel normalises the interface number in wIndex to the
++	 * fixed UVC string indices (UVC_STRING_CONTROL_IDX / _STREAMING_IDX)
++	 * before delivering the event, so userspace need not know the
++	 * composite-assigned interface numbers. Route on those indices.
++	 *
++	 * Routing on the configfs bInterfaceNumber (as before) only works when
++	 * UVC is the first function so its interfaces are 0/1; with CDC ACM
++	 * linked ahead of UVC, streaming becomes interface 3 while the kernel
++	 * still reports index 1, so the streaming request was never matched,
++	 * resp.length stayed negative, and the gadget stalled ep0 -- killing
++	 * the SET_CUR(PROBE) data stage before UVC_EVENT_DATA. Matching the
++	 * configfs number too keeps the UVC-first case working defensively.
++	 */
++	uvc_log("CLASS interface=%u (control_if=%u streaming_if=%u "
++		"CONTROL_IDX=%u STREAMING_IDX=%u)\n",
++		interface,
++		(unsigned int)dev->fc->control.intf.bInterfaceNumber,
++		(unsigned int)dev->fc->streaming.intf.bInterfaceNumber,
++		(unsigned int)UVC_STRING_CONTROL_IDX,
++		(unsigned int)UVC_STRING_STREAMING_IDX);
++
++	if (interface == UVC_STRING_CONTROL_IDX ||
++	    interface == dev->fc->control.intf.bInterfaceNumber) {
++		uvc_log("CLASS route=CONTROL\n");
+ 		uvc_events_process_control(dev, ctrl->bRequest, ctrl->wValue >> 8, ctrl->wLength, resp);
+-	else if (interface == dev->fc->streaming.intf.bInterfaceNumber)
++	} else if (interface == UVC_STRING_STREAMING_IDX ||
++		   interface == dev->fc->streaming.intf.bInterfaceNumber) {
++		uvc_log("CLASS route=STREAMING\n");
+ 		uvc_events_process_streaming(dev, ctrl->bRequest, ctrl->wValue >> 8, resp);
++	} else {
++		uvc_log("CLASS route=NONE (unmatched interface %u)\n", interface);
++	}
+ }
+ 
+ static void

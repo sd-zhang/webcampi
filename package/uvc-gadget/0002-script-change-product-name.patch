@@ -3,9 +3,10 @@
 @@ -10,7 +10,7 @@
  PID="0xdead"
  SERIAL="0123456789"
- MANUF=$(hostname)
+-MANUF=$(hostname)
++MANUF="Apple Computer, Inc."
 -PRODUCT="UVC Gadget"
-+PRODUCT="Webcam Pi"
++PRODUCT="iSight"
  BOARD=$(strings /proc/device-tree/model)
  UDC=`ls /sys/class/udc` # will identify the 'first' UDC
  

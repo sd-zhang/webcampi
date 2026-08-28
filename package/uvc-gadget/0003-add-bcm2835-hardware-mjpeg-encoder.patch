@@ -1,0 +1,719 @@
+From: PiSight port <hello@trex-ai.ca>
+Date: Wed, 27 Aug 2026 00:00:00 +0000
+Subject: [PATCH] Add bcm2835 V4L2 M2M hardware MJPEG encoder backend
+
+Adds a V4L2 mem2mem MJPEG encoder (bcm2835-codec, /dev/video11) used in
+preference to libjpeg, with automatic fallback to the software encoder
+when no hardware encoder is present.
+---
+diff --git a/include/uvcgadget/mjpeg_encoder.hpp b/include/uvcgadget/mjpeg_encoder.hpp
+index a3e92fc..66da305 100644
+--- a/include/uvcgadget/mjpeg_encoder.hpp
++++ b/include/uvcgadget/mjpeg_encoder.hpp
+@@ -8,12 +8,14 @@
+ #pragma once
+ 
+ #include <condition_variable>
++#include <memory>
+ #include <mutex>
+ #include <queue>
+ #include <thread>
+ #include <functional>
+ 
+ struct jpeg_compress_struct;
++class HwMjpegEncoder;
+ typedef std::function<void(void *, size_t, int64_t, unsigned int)> OutputReadyCallback;
+ 
+ struct StreamInfo
+@@ -42,6 +44,7 @@ private:
+ 	static const int NUM_ENC_THREADS = 4;
+ 
+ 	void encodeThread(int num);
++	void encodeThreadHw(int num);
+ 
+ 	/*
+ 	 * Handle the output buffers in another thread so as not to block the
+@@ -54,6 +57,13 @@ private:
+ 	bool abortOutput_;
+ 	uint64_t index_;
+ 
++	/*
++	 * When a V4L2 hardware JPEG encoder is available it is used instead of
++	 * libjpeg. hw_encoder_ is null when we fall back to software encoding.
++	 */
++	std::unique_ptr<HwMjpegEncoder> hw_encoder_;
++	int num_encode_threads_;
++
+ 	struct EncodeItem
+ 	{
+ 		void *mem;
+diff --git a/lib/hw_mjpeg_encoder.cpp b/lib/hw_mjpeg_encoder.cpp
+new file mode 100644
+index 0000000..ce1c51d
+--- /dev/null
++++ b/lib/hw_mjpeg_encoder.cpp
+@@ -0,0 +1,437 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * hw_mjpeg_encoder.cpp - hardware MJPEG encoder backend.
++ *
++ * Drives a V4L2 mem2mem JPEG encoder (the Raspberry Pi bcm2835-codec block,
++ * typically /dev/video11) to compress libcamera YUV420 frames into MJPEG.
++ *
++ * The bcm2835-codec encoder advertises V4L2_CAP_VIDEO_M2M_MPLANE, so the
++ * multi-planar API is used throughout. For YUV420 and MJPEG the driver always
++ * reports a single memory plane (num_planes == 1), so each queue uses one
++ * mmap'd buffer.
++ */
++
++#include <cerrno>
++#include <cstring>
++#include <dirent.h>
++#include <fcntl.h>
++#include <iostream>
++#include <string>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++#include <linux/videodev2.h>
++
++#include "hw_mjpeg_encoder.hpp"
++
++#define HW_FALLBACK_DEVICE "/dev/video11"
++
++namespace {
++
++int xioctl(int fd, unsigned long request, void *arg)
++{
++	int ret;
++	do {
++		ret = ioctl(fd, request, arg);
++	} while (ret == -1 && errno == EINTR);
++	return ret;
++}
++
++/* Does this queue on this fd support the given pixel format? */
++bool queueSupportsFormat(int fd, enum v4l2_buf_type type, uint32_t fourcc)
++{
++	for (unsigned int i = 0; ; i++) {
++		struct v4l2_fmtdesc fmtdesc;
++		memset(&fmtdesc, 0, sizeof(fmtdesc));
++		fmtdesc.index = i;
++		fmtdesc.type = type;
++
++		if (xioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) == -1)
++			return false;
++
++		if (fmtdesc.pixelformat == fourcc)
++			return true;
++	}
++}
++
++/*
++ * Return true if fd is a V4L2 M2M encoder that can take YUV420 in and emit
++ * MJPEG out.
++ */
++bool isJpegM2MEncoder(int fd)
++{
++	struct v4l2_capability cap;
++	memset(&cap, 0, sizeof(cap));
++	if (xioctl(fd, VIDIOC_QUERYCAP, &cap) == -1)
++		return false;
++
++	uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS)
++			      ? cap.device_caps
++			      : cap.capabilities;
++
++	if (!(caps & (V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_VIDEO_M2M)))
++		return false;
++
++	if (!(caps & V4L2_CAP_STREAMING))
++		return false;
++
++	bool mplane = caps & V4L2_CAP_VIDEO_M2M_MPLANE;
++	enum v4l2_buf_type out_type = mplane ? V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
++					     : V4L2_BUF_TYPE_VIDEO_OUTPUT;
++	enum v4l2_buf_type cap_type = mplane ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
++					     : V4L2_BUF_TYPE_VIDEO_CAPTURE;
++
++	return queueSupportsFormat(fd, out_type, V4L2_PIX_FMT_YUV420) &&
++	       queueSupportsFormat(fd, cap_type, V4L2_PIX_FMT_MJPEG);
++}
++
++} /* namespace */
++
++std::unique_ptr<HwMjpegEncoder> HwMjpegEncoder::Create(int quality)
++{
++	std::string chosen;
++	int chosen_fd = -1;
++
++	/*
++	 * Prefer dynamic discovery: enumerate /dev/videoN and pick the first
++	 * node that looks like a JPEG-capable M2M encoder. This avoids relying
++	 * on the codec always landing on /dev/video11.
++	 */
++	DIR *dir = opendir("/dev");
++	if (dir) {
++		struct dirent *ent;
++		while ((ent = readdir(dir)) != nullptr) {
++			if (strncmp(ent->d_name, "video", 5) != 0)
++				continue;
++
++			std::string path = std::string("/dev/") + ent->d_name;
++			int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
++			if (fd == -1)
++				continue;
++
++			if (isJpegM2MEncoder(fd)) {
++				chosen = path;
++				chosen_fd = fd;
++				break;
++			}
++			close(fd);
++		}
++		closedir(dir);
++	}
++
++	/* Fall back to the well-known bcm2835-codec encode node. */
++	if (chosen_fd == -1) {
++		int fd = open(HW_FALLBACK_DEVICE, O_RDWR | O_CLOEXEC);
++		if (fd != -1) {
++			if (isJpegM2MEncoder(fd)) {
++				chosen = HW_FALLBACK_DEVICE;
++				chosen_fd = fd;
++			} else {
++				close(fd);
++			}
++		}
++	}
++
++	if (chosen_fd == -1)
++		return nullptr;
++
++	return std::unique_ptr<HwMjpegEncoder>(
++		new HwMjpegEncoder(chosen_fd, std::move(chosen), quality));
++}
++
++HwMjpegEncoder::HwMjpegEncoder(int fd, std::string dev_path, int quality)
++	: fd_(fd), dev_path_(std::move(dev_path)), quality_(quality)
++{
++	/* Best-effort quality control; ignore failure (some fw ignores it). */
++	struct v4l2_control ctrl;
++	memset(&ctrl, 0, sizeof(ctrl));
++	ctrl.id = V4L2_CID_JPEG_COMPRESSION_QUALITY;
++	ctrl.value = quality_;
++	if (xioctl(fd_, VIDIOC_S_CTRL, &ctrl) == -1)
++		std::cerr << "HwMjpegEncoder: could not set JPEG quality: "
++			  << strerror(errno) << std::endl;
++}
++
++HwMjpegEncoder::~HwMjpegEncoder()
++{
++	stopStreaming();
++	releaseBuffers();
++	if (fd_ != -1)
++		close(fd_);
++}
++
++bool HwMjpegEncoder::Configure(unsigned int width, unsigned int height)
++{
++	if (configured_ && width == width_ && height == height_)
++		return true;
++
++	/* Geometry changed (or first call): tear down any existing state. */
++	if (streaming_)
++		stopStreaming();
++	releaseBuffers();
++	configured_ = false;
++
++	width_ = width;
++	height_ = height;
++
++	/* OUTPUT queue: raw YUV420 fed to the encoder. */
++	struct v4l2_format fmt;
++	memset(&fmt, 0, sizeof(fmt));
++	fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	fmt.fmt.pix_mp.width = width;
++	fmt.fmt.pix_mp.height = height;
++	fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_YUV420;
++	fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
++	fmt.fmt.pix_mp.num_planes = 1;
++	/* Full-range JPEG colour so decoded frames aren't washed out. */
++	fmt.fmt.pix_mp.colorspace = V4L2_COLORSPACE_JPEG;
++
++	if (xioctl(fd_, VIDIOC_S_FMT, &fmt) == -1) {
++		std::cerr << "HwMjpegEncoder: S_FMT(OUTPUT) failed: "
++			  << strerror(errno) << std::endl;
++		return false;
++	}
++
++	out_bytesperline_ = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
++	out_sizeimage_ = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
++
++	/* CAPTURE queue: compressed MJPEG out of the encoder. */
++	memset(&fmt, 0, sizeof(fmt));
++	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	fmt.fmt.pix_mp.width = width;
++	fmt.fmt.pix_mp.height = height;
++	fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_MJPEG;
++	fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
++	fmt.fmt.pix_mp.num_planes = 1;
++	fmt.fmt.pix_mp.colorspace = V4L2_COLORSPACE_JPEG;
++	/* Request a generous compressed buffer; driver may enlarge it. */
++	fmt.fmt.pix_mp.plane_fmt[0].sizeimage = width * height;
++
++	if (xioctl(fd_, VIDIOC_S_FMT, &fmt) == -1) {
++		std::cerr << "HwMjpegEncoder: S_FMT(CAPTURE) failed: "
++			  << strerror(errno) << std::endl;
++		return false;
++	}
++
++	if (!setupQueue(true) || !setupQueue(false))
++		return false;
++
++	if (!startStreaming())
++		return false;
++
++	configured_ = true;
++	return true;
++}
++
++/*
++ * Allocate a single MMAP buffer on the given queue and map it. output == true
++ * selects the OUTPUT (raw) queue, false the CAPTURE (MJPEG) queue.
++ */
++bool HwMjpegEncoder::setupQueue(bool output)
++{
++	enum v4l2_buf_type type = output ? V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
++					 : V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	const char *name = output ? "OUTPUT" : "CAPTURE";
++
++	struct v4l2_requestbuffers req;
++	memset(&req, 0, sizeof(req));
++	req.count = 1;
++	req.type = type;
++	req.memory = V4L2_MEMORY_MMAP;
++
++	if (xioctl(fd_, VIDIOC_REQBUFS, &req) == -1 || req.count < 1) {
++		std::cerr << "HwMjpegEncoder: REQBUFS(" << name << ") failed: "
++			  << strerror(errno) << std::endl;
++		return false;
++	}
++
++	struct v4l2_buffer buf;
++	struct v4l2_plane planes[VIDEO_MAX_PLANES];
++	memset(&buf, 0, sizeof(buf));
++	memset(planes, 0, sizeof(planes));
++	buf.type = type;
++	buf.memory = V4L2_MEMORY_MMAP;
++	buf.index = 0;
++	buf.length = VIDEO_MAX_PLANES;
++	buf.m.planes = planes;
++
++	if (xioctl(fd_, VIDIOC_QUERYBUF, &buf) == -1) {
++		std::cerr << "HwMjpegEncoder: QUERYBUF(" << name << ") failed: "
++			  << strerror(errno) << std::endl;
++		return false;
++	}
++
++	size_t length = buf.m.planes[0].length;
++	void *mem = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED,
++			 fd_, buf.m.planes[0].m.mem_offset);
++	if (mem == MAP_FAILED) {
++		std::cerr << "HwMjpegEncoder: mmap(" << name << ") failed: "
++			  << strerror(errno) << std::endl;
++		return false;
++	}
++
++	MappedBuffer &target = output ? out_buf_ : cap_buf_;
++	target.mem = mem;
++	target.length = length;
++	return true;
++}
++
++bool HwMjpegEncoder::startStreaming()
++{
++	enum v4l2_buf_type out_type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	enum v4l2_buf_type cap_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++
++	if (xioctl(fd_, VIDIOC_STREAMON, &out_type) == -1 ||
++	    xioctl(fd_, VIDIOC_STREAMON, &cap_type) == -1) {
++		std::cerr << "HwMjpegEncoder: STREAMON failed: "
++			  << strerror(errno) << std::endl;
++		return false;
++	}
++
++	streaming_ = true;
++	return true;
++}
++
++void HwMjpegEncoder::stopStreaming()
++{
++	if (!streaming_)
++		return;
++
++	enum v4l2_buf_type out_type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	enum v4l2_buf_type cap_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	xioctl(fd_, VIDIOC_STREAMOFF, &out_type);
++	xioctl(fd_, VIDIOC_STREAMOFF, &cap_type);
++	streaming_ = false;
++}
++
++void HwMjpegEncoder::releaseBuffers()
++{
++	if (out_buf_.mem) {
++		munmap(out_buf_.mem, out_buf_.length);
++		out_buf_ = MappedBuffer{};
++	}
++	if (cap_buf_.mem) {
++		munmap(cap_buf_.mem, cap_buf_.length);
++		cap_buf_ = MappedBuffer{};
++	}
++
++	/* Free the driver-side buffers so a later reconfigure starts clean. */
++	if (fd_ != -1) {
++		for (bool output : { true, false }) {
++			struct v4l2_requestbuffers req;
++			memset(&req, 0, sizeof(req));
++			req.count = 0;
++			req.type = output ? V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
++					  : V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++			req.memory = V4L2_MEMORY_MMAP;
++			xioctl(fd_, VIDIOC_REQBUFS, &req);
++		}
++	}
++}
++
++size_t HwMjpegEncoder::Encode(const uint8_t *src, unsigned int src_stride,
++			      unsigned int width, unsigned int height,
++			      uint8_t *dest, size_t dest_size)
++{
++	if (!configured_)
++		return 0;
++
++	/*
++	 * Copy the libcamera I420 frame into the OUTPUT buffer, converting the
++	 * source (StreamInfo) stride to the driver-chosen stride. This is the
++	 * single frame copy noted as acceptable for correctness-first.
++	 */
++	unsigned int dst_stride = out_bytesperline_;
++	unsigned int src_cstride = src_stride / 2;
++	unsigned int dst_cstride = dst_stride / 2;
++	unsigned int cheight = height / 2;
++
++	const uint8_t *sY = src;
++	const uint8_t *sU = sY + (size_t)src_stride * height;
++	const uint8_t *sV = sU + (size_t)src_cstride * cheight;
++
++	uint8_t *dY = static_cast<uint8_t *>(out_buf_.mem);
++	uint8_t *dU = dY + (size_t)dst_stride * height;
++	uint8_t *dV = dU + (size_t)dst_cstride * cheight;
++
++	for (unsigned int y = 0; y < height; y++)
++		memcpy(dY + (size_t)y * dst_stride, sY + (size_t)y * src_stride,
++		       width);
++	for (unsigned int y = 0; y < cheight; y++) {
++		memcpy(dU + (size_t)y * dst_cstride,
++		       sU + (size_t)y * src_cstride, width / 2);
++		memcpy(dV + (size_t)y * dst_cstride,
++		       sV + (size_t)y * src_cstride, width / 2);
++	}
++
++	/* Queue the raw frame. */
++	struct v4l2_buffer buf;
++	struct v4l2_plane plane;
++	memset(&buf, 0, sizeof(buf));
++	memset(&plane, 0, sizeof(plane));
++	buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	buf.memory = V4L2_MEMORY_MMAP;
++	buf.index = 0;
++	buf.length = 1;
++	buf.m.planes = &plane;
++	plane.bytesused = out_sizeimage_;
++	plane.length = out_buf_.length;
++
++	if (xioctl(fd_, VIDIOC_QBUF, &buf) == -1) {
++		std::cerr << "HwMjpegEncoder: QBUF(OUTPUT) failed: "
++			  << strerror(errno) << std::endl;
++		return 0;
++	}
++
++	/* Queue the empty capture buffer to receive the MJPEG frame. */
++	memset(&buf, 0, sizeof(buf));
++	memset(&plane, 0, sizeof(plane));
++	buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	buf.memory = V4L2_MEMORY_MMAP;
++	buf.index = 0;
++	buf.length = 1;
++	buf.m.planes = &plane;
++	plane.length = cap_buf_.length;
++
++	if (xioctl(fd_, VIDIOC_QBUF, &buf) == -1) {
++		std::cerr << "HwMjpegEncoder: QBUF(CAPTURE) failed: "
++			  << strerror(errno) << std::endl;
++		return 0;
++	}
++
++	/* Dequeue the consumed raw buffer (blocking). */
++	memset(&buf, 0, sizeof(buf));
++	memset(&plane, 0, sizeof(plane));
++	buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	buf.memory = V4L2_MEMORY_MMAP;
++	buf.length = 1;
++	buf.m.planes = &plane;
++	if (xioctl(fd_, VIDIOC_DQBUF, &buf) == -1) {
++		std::cerr << "HwMjpegEncoder: DQBUF(OUTPUT) failed: "
++			  << strerror(errno) << std::endl;
++		return 0;
++	}
++
++	/* Dequeue the finished MJPEG buffer (blocking). */
++	memset(&buf, 0, sizeof(buf));
++	memset(&plane, 0, sizeof(plane));
++	buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	buf.memory = V4L2_MEMORY_MMAP;
++	buf.length = 1;
++	buf.m.planes = &plane;
++	if (xioctl(fd_, VIDIOC_DQBUF, &buf) == -1) {
++		std::cerr << "HwMjpegEncoder: DQBUF(CAPTURE) failed: "
++			  << strerror(errno) << std::endl;
++		return 0;
++	}
++
++	size_t bytesused = buf.m.planes[0].bytesused;
++	if (bytesused == 0)
++		return 0;
++	if (bytesused > dest_size)
++		bytesused = dest_size;
++
++	memcpy(dest, cap_buf_.mem, bytesused);
++	return bytesused;
++}
+diff --git a/lib/hw_mjpeg_encoder.hpp b/lib/hw_mjpeg_encoder.hpp
+new file mode 100644
+index 0000000..18947bd
+--- /dev/null
++++ b/lib/hw_mjpeg_encoder.hpp
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++/*
++ * hw_mjpeg_encoder.hpp - hardware MJPEG encoder backend.
++ *
++ * Drives a V4L2 mem2mem stateless JPEG encoder (e.g. the Raspberry Pi
++ * bcm2835-codec block exposed as /dev/video11) to compress libcamera YUV420
++ * frames into MJPEG without touching the CPU-bound libjpeg path.
++ */
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++
++class HwMjpegEncoder
++{
++public:
++	/*
++	 * Probe the system for a usable V4L2 M2M JPEG encoder and return an
++	 * instance ready to be Configure()d. Returns nullptr if no suitable
++	 * hardware encoder is found or it cannot be opened. The caller should
++	 * fall back to the software (libjpeg) encoder in that case.
++	 */
++	static std::unique_ptr<HwMjpegEncoder> Create(int quality = 50);
++
++	~HwMjpegEncoder();
++
++	HwMjpegEncoder(const HwMjpegEncoder &) = delete;
++	HwMjpegEncoder &operator=(const HwMjpegEncoder &) = delete;
++
++	/*
++	 * (Re)configure the encoder for the given frame geometry. Safe to call
++	 * on every frame; it only performs real work when the resolution
++	 * changes. Returns false on failure.
++	 */
++	bool Configure(unsigned int width, unsigned int height);
++
++	/*
++	 * Encode a single libcamera YUV420 (I420) frame.
++	 *
++	 *   src        - mapped libcamera frame buffer (Y then U then V planes)
++	 *   src_stride - luma stride in bytes as reported by StreamInfo
++	 *   width      - visible width in pixels
++	 *   height     - visible height in pixels
++	 *   dest       - destination buffer for the MJPEG bitstream
++	 *   dest_size  - capacity of dest in bytes
++	 *
++	 * Returns the number of MJPEG bytes written to dest, or 0 on failure.
++	 */
++	size_t Encode(const uint8_t *src, unsigned int src_stride,
++		      unsigned int width, unsigned int height,
++		      uint8_t *dest, size_t dest_size);
++
++	const std::string &DevicePath() const { return dev_path_; }
++
++private:
++	HwMjpegEncoder(int fd, std::string dev_path, int quality);
++
++	struct MappedBuffer {
++		void *mem = nullptr;
++		size_t length = 0;
++	};
++
++	bool startStreaming();
++	void stopStreaming();
++	void releaseBuffers();
++	bool setupQueue(bool output);
++
++	int fd_;
++	std::string dev_path_;
++	int quality_;
++
++	unsigned int width_ = 0;
++	unsigned int height_ = 0;
++
++	/* Driver-chosen luma stride and total OUTPUT buffer size. */
++	unsigned int out_bytesperline_ = 0;
++	unsigned int out_sizeimage_ = 0;
++
++	MappedBuffer out_buf_;
++	MappedBuffer cap_buf_;
++
++	bool configured_ = false;
++	bool streaming_ = false;
++};
+diff --git a/lib/meson.build b/lib/meson.build
+index 7d048a3..6aa6ad6 100644
+--- a/lib/meson.build
++++ b/lib/meson.build
+@@ -21,6 +21,7 @@ endif
+ 
+ if libcamera.found() and libjpeg.found() and threads.found()
+   libuvcgadget_sources += files(['mjpeg_encoder.cpp'])
++  libuvcgadget_sources += files(['hw_mjpeg_encoder.cpp'])
+ endif
+ 
+ if pigpio.found() and threads.found()
+diff --git a/lib/mjpeg_encoder.cpp b/lib/mjpeg_encoder.cpp
+index 41a13d5..6200226 100644
+--- a/lib/mjpeg_encoder.cpp
++++ b/lib/mjpeg_encoder.cpp
+@@ -14,6 +14,7 @@
+ #include <libcamera/libcamera.h>
+ 
+ #include "mjpeg_encoder.hpp"
++#include "hw_mjpeg_encoder.hpp"
+ 
+ #if JPEG_LIB_VERSION_MAJOR > 9 || (JPEG_LIB_VERSION_MAJOR == 9 && JPEG_LIB_VERSION_MINOR >= 4)
+ typedef size_t jpeg_mem_len_t;
+@@ -22,17 +23,33 @@ typedef unsigned long jpeg_mem_len_t;
+ #endif
+ 
+ MjpegEncoder::MjpegEncoder()
+-	: abortEncode_(false), abortOutput_(false), index_(0)
++	: abortEncode_(false), abortOutput_(false), index_(0),
++	  num_encode_threads_(NUM_ENC_THREADS)
+ {
++	/*
++	 * Try to grab a V4L2 hardware JPEG encoder (e.g. bcm2835-codec). If we
++	 * get one, a single worker thread drives it serially; otherwise we fall
++	 * back to the multi-threaded libjpeg software path.
++	 */
++	hw_encoder_ = HwMjpegEncoder::Create();
++	if (hw_encoder_) {
++		num_encode_threads_ = 1;
++		std::cout << "MJPEG encoder: using bcm2835 hardware encoder ("
++			  << hw_encoder_->DevicePath() << ")" << std::endl;
++	} else {
++		std::cout << "MJPEG encoder: hardware encoder unavailable, "
++			     "using libjpeg" << std::endl;
++	}
++
+ 	output_thread_ = std::thread(&MjpegEncoder::outputThread, this);
+-	for (int i = 0; i < NUM_ENC_THREADS; i++)
++	for (int i = 0; i < num_encode_threads_; i++)
+ 		encode_thread_[i] = std::thread(std::bind(&MjpegEncoder::encodeThread, this, i));
+ }
+ 
+ MjpegEncoder::~MjpegEncoder()
+ {
+ 	abortEncode_ = true;
+-	for (int i = 0; i < NUM_ENC_THREADS; i++)
++	for (int i = 0; i < num_encode_threads_; i++)
+ 		encode_thread_[i].join();
+ 	abortOutput_ = true;
+ 	output_thread_.join();
+@@ -96,8 +113,72 @@ void MjpegEncoder::encodeJPEG(struct jpeg_compress_struct &cinfo, EncodeItem &it
+ 	buffer_len = jpeg_mem_len;
+ }
+ 
++void MjpegEncoder::encodeThreadHw(int num)
++{
++	EncodeItem encode_item;
++	bool warned = false;
++
++	while (true)
++	{
++		{
++			std::unique_lock<std::mutex> lock(encode_mutex_);
++			while (true)
++			{
++				using namespace std::chrono_literals;
++				if (abortEncode_ && encode_queue_.empty())
++					return;
++				if (!encode_queue_.empty())
++				{
++					encode_item = encode_queue_.front();
++					encode_queue_.pop();
++					break;
++				}
++				else
++					encode_cond_var_.wait_for(lock, 200ms);
++			}
++		}
++
++		uint8_t *dest = (uint8_t *)encode_item.dest;
++		size_t buffer_len = 0;
++
++		if (hw_encoder_->Configure(encode_item.info.width, encode_item.info.height))
++			buffer_len = hw_encoder_->Encode((const uint8_t *)encode_item.mem,
++							 encode_item.info.stride,
++							 encode_item.info.width,
++							 encode_item.info.height,
++							 dest, encode_item.size);
++
++		if (buffer_len == 0 && !warned) {
++			std::cerr << "MJPEG encoder: hardware encode failed; "
++				     "frame dropped" << std::endl;
++			warned = true;
++		}
++
++		/*
++		 * Always forward the frame to the output thread (even on a zero
++		 * length failure) so the frame index sequence stays contiguous
++		 * and outputThread does not stall.
++		 */
++		OutputItem output_item = {
++			dest,
++			buffer_len,
++			encode_item.timestamp_us,
++			encode_item.index,
++			encode_item.cookie
++		};
++		std::lock_guard<std::mutex> lock(output_mutex_);
++		output_queue_[num].push(output_item);
++		output_cond_var_.notify_one();
++	}
++}
++
+ void MjpegEncoder::encodeThread(int num)
+ {
++	if (hw_encoder_) {
++		encodeThreadHw(num);
++		return;
++	}
++
+ 	struct jpeg_compress_struct cinfo;
+ 	struct jpeg_error_mgr jerr;
+ 	EncodeItem encode_item;

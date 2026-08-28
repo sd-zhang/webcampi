@@ -1,0 +1,101 @@
+Persist the UVC gadget script customizations so they survive a clean
+Buildroot rebuild: MJPEG-only 30fps descriptors (640x480/1280x720/1920x1080),
+explicit dwDefaultFrameInterval (POSIX word-split, no awk dependency),
+bDefaultFrameIndex=2 (prefer the proven 720p frame; 640x480 default negotiates
+poorly on macOS), and the CDC ACM serial debug console composite function.
+---
+--- a/scripts/uvc-gadget.sh
++++ b/scripts/uvc-gadget.sh
+@@ -38,6 +38,14 @@
+ 	cat <<EOF > $wdir/dwFrameInterval
+ $6
+ EOF
++
++	# Make the default interval the first advertised interval. Otherwise the
++	# kernel keeps its 15fps (666666) default even when we only advertise
++	# 30fps, which some hosts (e.g. QuickTime) reject outright.
++	# Use POSIX word splitting only (no awk): this is a minimal image.
++	set -- $6
++	FIRST_INTERVAL=$1
++	echo "$FIRST_INTERVAL" > "$wdir/dwDefaultFrameInterval"
+ }
+ 
+ # This function sets up the UVC gadget function in configfs and binds us
+@@ -55,47 +63,23 @@
+ 	echo "Renaming function"
+ 	echo -n $PRODUCT > functions/$FUNCTION/function_name
+ 
+-	create_frame $FUNCTION 640 480 uncompressed u "333333
+-416667
+-500000
+-666666
+-1000000
+-1333333
+-2000000
+-"
+-	create_frame $FUNCTION 1280 720 uncompressed u "1000000
+-1333333
+-2000000
+-"
+-	create_frame $FUNCTION 1920 1080 uncompressed u "2000000"
+ 	create_frame $FUNCTION 640 480 mjpeg m "333333
+-416667
+-500000
+-666666
+-1000000
+-1333333
+-2000000
+ "
+ 	create_frame $FUNCTION 1280 720 mjpeg m "333333
+-416667
+-500000
+-666666
+-1000000
+-1333333
+-2000000
+ "
+ 	create_frame $FUNCTION 1920 1080 mjpeg m "333333
+-416667
+-500000
+-666666
+-1000000
+-1333333
+-2000000
+ "
+ 
++	# Prefer the proven 1280x720 MJPEG frame (index 2) as the default frame.
++	# The 640x480 default (index 1) does not negotiate cleanly on macOS, which
++	# breaks hosts (e.g. QuickTime) that follow the advertised default frame.
++	# Frame indices are assigned by creation order and are unaffected by this.
++	# Must be written BEFORE the format is linked into the header below: the
++	# kernel returns -EBUSY once the format is linked.
++	echo 2 > functions/$FUNCTION/streaming/mjpeg/m/bDefaultFrameIndex
++
+ 	mkdir functions/$FUNCTION/streaming/header/h
+ 	cd functions/$FUNCTION/streaming/header/h
+-	ln -s ../../uncompressed/u
+ 	ln -s ../../mjpeg/m
+ 	cd ../../class/fs
+ 	ln -s ../../header/h
+@@ -152,9 +136,6 @@
+ 
+ 	rm functions/$FUNCTION/control/class/*/h
+ 	rm functions/$FUNCTION/streaming/class/*/h
+-	rm functions/$FUNCTION/streaming/header/h/u
+-	rmdir functions/$FUNCTION/streaming/uncompressed/u/*/
+-	rmdir functions/$FUNCTION/streaming/uncompressed/u
+ 	rm -rf functions/$FUNCTION/streaming/mjpeg/m/*/
+ 	rm -rf functions/$FUNCTION/streaming/mjpeg/m
+ 	rmdir functions/$FUNCTION/streaming/header/h
+@@ -193,6 +174,11 @@
+ 	mkdir configs/c.1
+ 	mkdir configs/c.1/strings/0x409
+ 
++        echo "Creating serial console..."
++        mkdir functions/acm.usb0
++        ln -s functions/acm.usb0 configs/c.1/
++        echo "OK"
++
+ 	echo "Creating functions..."
+ 	create_uvc configs/c.1 uvc.0
+ 	echo "OK"

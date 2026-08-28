@@ -1,0 +1,229 @@
+Add flushed, timestamped diagnostic logging to /tmp/uvc-events.log across the
+UVC control plane (lib/uvc.c) and data plane (lib/stream.c) via a shared
+static-inline logger (lib/uvc-debug.h). Logs SETUP, full SET_CUR(PROBE)/
+SET_CUR(COMMIT) streaming-control payloads, STREAMON/STREAMOFF, stream
+start/stop, and first-frame delivery. Diagnostic only; no behaviour change.
+---
+--- /dev/null	2026-07-30 13:39:18.485552404 -0600
++++ b/lib/uvc-debug.h
+@@ -0,0 +1,44 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * uvc-debug.h - flushed, timestamped diagnostic logging for the UVC gadget.
++ *
++ * Writes to /tmp/uvc-events.log in append mode and flushes after every entry
++ * so the log survives stdio buffering and is readable live from the USB ACM
++ * shell. Diagnostic only; it has no effect on any functional behaviour.
++ *
++ * Defined as a static inline so both lib/uvc.c (control plane) and lib/stream.c
++ * (data plane) can log to the same file without adding a new build unit. Each
++ * translation unit keeps its own append-mode handle; O_APPEND keeps writes
++ * ordered at end-of-file and the microsecond timestamps disambiguate them.
++ */
++
++#ifndef __UVC_DEBUG_H__
++#define __UVC_DEBUG_H__
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <sys/time.h>
++
++__attribute__((format(printf, 1, 2)))
++static inline void uvc_log(const char *fmt, ...)
++{
++	static FILE *logfp;
++	struct timeval tv;
++	va_list ap;
++
++	if (!logfp) {
++		logfp = fopen("/tmp/uvc-events.log", "a");
++		if (!logfp)
++			return;
++	}
++
++	gettimeofday(&tv, NULL);
++	fprintf(logfp, "[%ld.%06ld] ", (long)tv.tv_sec, (long)tv.tv_usec);
++
++	va_start(ap, fmt);
++	vfprintf(logfp, fmt, ap);
++	va_end(ap);
++	fflush(logfp);
++}
++
++#endif /* __UVC_DEBUG_H__ */
+--- a/lib/uvc.c
++++ b/lib/uvc.c
+@@ -21,6 +21,7 @@
+ #include "events.h"
+ #include "stream.h"
+ #include "tools.h"
++#include "uvc-debug.h"
+ #include "uvc.h"
+ #include "v4l2.h"
+ 
+@@ -195,6 +196,8 @@
+ 			   struct uvc_request_data *resp)
+ {
+ 	printf("control request (req %s cs %s)\n", uvc_request_name(req), pu_control_name(cs));
++	uvc_log("CONTROL req=%s cs=%s len=%u\n", uvc_request_name(req),
++		pu_control_name(cs), len);
+ 	(void)dev;
+ 
+ 	/*
+@@ -216,6 +219,9 @@
+ 	if (cs != UVC_VS_PROBE_CONTROL && cs != UVC_VS_COMMIT_CONTROL)
+ 		return;
+ 
++	uvc_log("STREAMING req=%s cs=%s\n", uvc_request_name(req),
++		cs == UVC_VS_PROBE_CONTROL ? "PROBE" : "COMMIT");
++
+ 	ctrl = (struct uvc_streaming_control *)&resp->data;
+ 	resp->length = sizeof *ctrl;
+ 
+@@ -284,6 +290,9 @@
+ 	printf("bRequestType %02x bRequest %02x wValue %04x wIndex %04x "
+ 		"wLength %04x\n", ctrl->bRequestType, ctrl->bRequest,
+ 		ctrl->wValue, ctrl->wIndex, ctrl->wLength);
++	uvc_log("SETUP bRequestType=%02x bRequest=%02x wValue=%04x wIndex=%04x wLength=%04x\n",
++		ctrl->bRequestType, ctrl->bRequest, ctrl->wValue,
++		ctrl->wIndex, ctrl->wLength);
+ 
+ 	switch (ctrl->bRequestType & USB_TYPE_MASK) {
+ 	case USB_TYPE_STANDARD:
+@@ -323,6 +332,23 @@
+ 		return;
+ 	}
+ 
++	uvc_log("%s SET_CUR payload len=%d bmHint=0x%04x bFormatIndex=%u "
++		"bFrameIndex=%u dwFrameInterval=%u wKeyFrameRate=%u wPFrameRate=%u "
++		"wCompQuality=%u wCompWindowSize=%u wDelay=%u dwMaxVideoFrameSize=%u "
++		"dwMaxPayloadTransferSize=%u dwClockFrequency=%u bmFramingInfo=0x%02x "
++		"bPreferedVersion=%u bMinVersion=%u bMaxVersion=%u\n",
++		dev->control == UVC_VS_COMMIT_CONTROL ? "COMMIT" : "PROBE",
++		data->length,
++		(unsigned int)ctrl->bmHint, (unsigned int)ctrl->bFormatIndex,
++		(unsigned int)ctrl->bFrameIndex, (unsigned int)ctrl->dwFrameInterval,
++		(unsigned int)ctrl->wKeyFrameRate, (unsigned int)ctrl->wPFrameRate,
++		(unsigned int)ctrl->wCompQuality, (unsigned int)ctrl->wCompWindowSize,
++		(unsigned int)ctrl->wDelay, (unsigned int)ctrl->dwMaxVideoFrameSize,
++		(unsigned int)ctrl->dwMaxPayloadTransferSize,
++		(unsigned int)ctrl->dwClockFrequency, (unsigned int)ctrl->bmFramingInfo,
++		(unsigned int)ctrl->bPreferedVersion, (unsigned int)ctrl->bMinVersion,
++		(unsigned int)ctrl->bMaxVersion);
++
+ 	uvc_fill_streaming_control(dev, target, ctrl->bFormatIndex,
+ 				   ctrl->bFrameIndex, ctrl->dwFrameInterval);
+ 
+@@ -352,6 +378,12 @@
+ 		/* fps is guaranteed to be non-zero and thus valid. */
+ 		fps = 1.0 / (target->dwFrameInterval / 10000000.0);
+ 		uvc_stream_set_frame_rate(dev->stream, fps);
++
++		uvc_log("COMMIT resolved %ux%u fcc=%08x dwMaxVideoFrameSize=%u "
++			"dwMaxPayloadTransferSize=%u fps=%u\n",
++			frame->width, frame->height, format->fcc,
++			target->dwMaxVideoFrameSize,
++			target->dwMaxPayloadTransferSize, fps);
+ 	}
+ }
+ 
+@@ -375,22 +407,29 @@
+ 
+ 	switch (v4l2_event.type) {
+ 	case UVC_EVENT_CONNECT:
++		uvc_log("EVENT_CONNECT\n");
++		return;
+ 	case UVC_EVENT_DISCONNECT:
++		uvc_log("EVENT_DISCONNECT\n");
+ 		return;
+ 
+ 	case UVC_EVENT_SETUP:
++		uvc_log("EVENT_SETUP\n");
+ 		uvc_events_process_setup(dev, &uvc_event->req, &resp);
+ 		break;
+ 
+ 	case UVC_EVENT_DATA:
++		uvc_log("EVENT_DATA\n");
+ 		uvc_events_process_data(dev, &uvc_event->data);
+ 		return;
+ 
+ 	case UVC_EVENT_STREAMON:
++		uvc_log("EVENT_STREAMON\n");
+ 		uvc_stream_enable(dev->stream, 1);
+ 		return;
+ 
+ 	case UVC_EVENT_STREAMOFF:
++		uvc_log("EVENT_STREAMOFF\n");
+ 		uvc_stream_enable(dev->stream, 0);
+ 		return;
+ 	}
+--- a/lib/stream.c
++++ b/lib/stream.c
+@@ -15,6 +15,7 @@
+ #include "events.h"
+ #include "gpio.h"
+ #include "stream.h"
++#include "uvc-debug.h"
+ #include "uvc.h"
+ #include "v4l2.h"
+ #include "video-buffers.h"
+@@ -60,6 +61,9 @@
+ 	buffer->bytesused = stream->frozen_size;
+ }
+ 
++/* Diagnostic: set on stream enable, cleared after logging the first frame. */
++static int uvc_dbg_first_frame;
++
+ static void uvc_stream_source_process(void *d,
+ 				      struct video_source *src __attribute__((unused)),
+ 				      struct video_buffer *buffer)
+@@ -67,9 +71,15 @@
+ 	struct uvc_stream *stream = d;
+ 	struct v4l2_device *sink = uvc_v4l2_device(stream->uvc);
+ 
++	if (uvc_dbg_first_frame) {
++		uvc_dbg_first_frame = 0;
++		uvc_log("FIRST_FRAME source->sink index=%u bytesused=%u\n",
++			buffer->index, buffer->bytesused);
++	}
++
+ 	if (stream->frozen)
+ 		uvc_stream_spoof_buffer(stream, buffer);
+-		
++
+ 	v4l2_queue_buffer(sink, buffer);
+ }
+ 
+@@ -266,6 +276,7 @@
+ static int uvc_stream_start(struct uvc_stream *stream)
+ {
+ 	printf("Starting video stream.\n");
++	uvc_log("STREAM_START source_type=%d\n", stream->src->type);
+ 
+ 	switch (stream->src->type) {
+ 	case VIDEO_SOURCE_DMABUF:
+@@ -291,6 +302,7 @@
+ 	struct v4l2_device *sink = uvc_v4l2_device(stream->uvc);
+ 
+ 	printf("Stopping video stream.\n");
++	uvc_log("STREAM_STOP\n");
+ 
+ 	events_unwatch_fd(stream->events, sink->fd, EVENT_WRITE);
+ 
+@@ -305,10 +317,14 @@
+ 
+ void uvc_stream_enable(struct uvc_stream *stream, int enable)
+ {
+-	if (enable)
++	uvc_log("STREAM_ENABLE enable=%d\n", enable);
++
++	if (enable) {
++		uvc_dbg_first_frame = 1;
+ 		uvc_stream_start(stream);
+-	else
++	} else {
+ 		uvc_stream_stop(stream);
++	}
+ 
+ 	stream->active = enable;
+ 
