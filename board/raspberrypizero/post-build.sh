@@ -14,3 +14,6 @@ fi
 # No CDC ACM serial console in this composite (opening the ACM tty was shown to
 # persistently degrade UVC). Ensure no getty on the now-absent ttyGS0.
 sed -i '/^ttyGS0:/d' "${TARGET_DIR}/etc/inittab"
+
+# /boot mountpoint for the FAT config partition (ro squashfs cannot mkdir at runtime)
+mkdir -p "${TARGET_DIR}/boot"

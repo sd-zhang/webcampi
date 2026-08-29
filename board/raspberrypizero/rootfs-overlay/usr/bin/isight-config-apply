@@ -1,0 +1,35 @@
+#!/bin/sh
+# isight-config-apply - translate the persistent config (config.json on the FAT
+# boot partition, editable from any host) into /run/isight.env for the gadget
+# script + camera daemon. Best-effort: any failure falls back to compiled
+# defaults and never blocks the camera.
+BOOT=/boot
+DEV=/dev/mmcblk0p1
+CFG="$BOOT/isight.json"
+DEFAULT=/etc/isight/config.default.json
+OUT=/run/isight.env
+
+[ -e "$DEV" ] || { mdev -s 2>/dev/null; [ -e "$DEV" ] || mknod "$DEV" b 179 1 2>/dev/null; }
+grep -q " $BOOT " /proc/mounts || mount -t vfat -o ro,noatime "$DEV" "$BOOT" 2>/dev/null
+
+# seed a default onto the boot FAT on first boot so it is visible to edit
+if grep -q " $BOOT " /proc/mounts && { [ ! -f "$CFG" ] || ! jq -e . "$CFG" >/dev/null 2>&1; }; then
+	mount -o remount,rw "$BOOT" 2>/dev/null && cp "$DEFAULT" "$CFG" 2>/dev/null
+	sync; mount -o remount,ro "$BOOT" 2>/dev/null
+fi
+
+src=$DEFAULT
+[ -f "$CFG" ] && jq -e . "$CFG" >/dev/null 2>&1 && src=$CFG
+
+res=$(jq -r '.resolutions[]? // empty' "$src" 2>/dev/null | grep -E '^[0-9]+x[0-9]+$' | tr '\n' ' ')
+[ -n "$res" ] || res="1280x720 1920x1080"
+fov=$(jq -r '.fov // 75' "$src" 2>/dev/null)
+case "$fov" in ''|*[!0-9]*) fov=75 ;; esac
+logo=$(jq -r '.logo_light // "activity"' "$src" 2>/dev/null)
+case "$logo" in off|on|activity) ;; *) logo=activity ;; esac
+
+cat > "$OUT" <<EOT
+ISIGHT_RESOLUTIONS="$res"
+ISIGHT_FOV=$fov
+ISIGHT_LOGO=$logo
+EOT

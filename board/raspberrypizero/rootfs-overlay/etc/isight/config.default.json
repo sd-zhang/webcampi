@@ -1,0 +1,5 @@
+{
+  "resolutions": ["1280x720", "1920x1080"],
+  "fov": 75,
+  "logo_light": "activity"
+}

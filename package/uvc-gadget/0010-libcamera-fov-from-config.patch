@@ -1,0 +1,54 @@
+libcamera: apply field-of-view from the persistent config
+
+Read ISIGHT_FOV (degrees, populated by isight-config-apply) and, when the camera
+exposes ScalerCrop, crop the centre of the sensor's ScalerCropMaximum via the
+ISP scaler so a narrower FOV zooms in with no CPU pixel work. The full sensor is
+treated as ~75 deg; values >= 75 or unset leave the full field of view. Zoom is
+clamped to 1x-3x. Purely additive and guarded on control availability.
+
+Signed-off-by: webcampi <webcampi@localhost>
+
+--- a/lib/libcamera-source.cpp
++++ b/lib/libcamera-source.cpp
+@@ -19,6 +19,7 @@
+ #include <map>
+ #include <sys/mman.h>
+ 
++#include <cmath>
+ #include <libcamera/libcamera.h>
+ #include <linux/videodev2.h>
+ 
+@@ -580,6 +581,33 @@
+ 			std::cout << "Enabling continuous auto-focus" << std::endl;
+ 			src->controls.set(controls::AfMode, controls::AfModeContinuous);
+ 		}
++
++		/*
++		 * Field of view from the persistent config (ISIGHT_FOV, degrees).
++		 * The full sensor is ~75 deg; a narrower value crops the centre via
++		 * the ISP scaler (no CPU pixel work). >=75 or unset leaves full FOV.
++		 */
++		const char *fov = getenv("ISIGHT_FOV");
++		if (fov && infoMap.find(&controls::ScalerCrop) != infoMap.end()) {
++			const float full_fov = 75.0f, pi = 3.14159265f;
++			float deg = (float)atof(fov);
++			if (deg > 0.0f && deg < full_fov) {
++				const auto area = src->camera->properties().get(properties::ScalerCropMaximum);
++				if (area) {
++					float zoom = tanf(full_fov / 2.0f * pi / 180.0f) /
++						     tanf(deg / 2.0f * pi / 180.0f);
++					if (zoom < 1.0f) zoom = 1.0f;
++					if (zoom > 3.0f) zoom = 3.0f;
++					Rectangle full = *area;
++					unsigned int w = (unsigned int)(full.width / zoom);
++					unsigned int h = (unsigned int)(full.height / zoom);
++					Rectangle crop(full.x + (int)((full.width - w) / 2),
++						       full.y + (int)((full.height - h) / 2), w, h);
++					src->controls.set(controls::ScalerCrop, crop);
++					std::cout << "FOV: " << deg << " deg (zoom " << zoom << ")" << std::endl;
++				}
++			}
++		}
+ 	}
+ 
+ 	return &src->src;

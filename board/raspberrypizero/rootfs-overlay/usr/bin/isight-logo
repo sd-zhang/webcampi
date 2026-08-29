@@ -1,0 +1,19 @@
+#!/bin/sh
+# isight-logo {off|on|activity} - rear logo LED on GPIO 23, via pigpiod (pigs),
+# the same interface the camera daemon uses. "activity" mirrors the streaming
+# pin (GPIO 24). Defaults to $ISIGHT_LOGO if no arg.
+LOGO=23
+ACT=24
+mode="${1:-$ISIGHT_LOGO}"
+[ -n "$mode" ] || mode=activity
+case "$mode" in
+	off) pigs w $LOGO 0 2>/dev/null ;;
+	on)  pigs w $LOGO 1 2>/dev/null ;;
+	activity)
+		( while :; do
+			s=$(pigs r $ACT 2>/dev/null)
+			case "$s" in 0|1) pigs w $LOGO "$s" 2>/dev/null ;; esac
+			sleep 1
+		done ) &
+		;;
+esac

@@ -1,0 +1,6 @@
+# Mount the FAT boot partition at runtime to read the persistent config
+# (/boot/isight.json). The base fragment omits FAT; enable it minimally.
+CONFIG_FAT_FS=y
+CONFIG_VFAT_FS=y
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ISO8859_1=y

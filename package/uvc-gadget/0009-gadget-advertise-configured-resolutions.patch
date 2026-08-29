@@ -1,0 +1,47 @@
+gadget: advertise only the resolutions from the persistent config
+
+Replace the three hard-coded MJPEG frame sizes with a loop over
+ISIGHT_RESOLUTIONS (space-separated WxH, populated by isight-config-apply from
+config.json on the FAT boot partition). Restricting the advertised modes is the
+point of the setting: the host can only request what the gadget lists. Falls
+back to the proven 1280x720 + 1920x1080 pair when the config is absent or empty,
+and defaults to the first advertised frame (index 1) for macOS.
+
+Signed-off-by: webcampi <webcampi@localhost>
+
+--- a/scripts/uvc-gadget.sh
++++ b/scripts/uvc-gadget.sh
+@@ -63,20 +63,23 @@
+ 	echo "Renaming function"
+ 	echo -n $PRODUCT > functions/$FUNCTION/function_name
+ 
+-	create_frame $FUNCTION 640 480 mjpeg m "333333
+-"
+-	create_frame $FUNCTION 1280 720 mjpeg m "333333
+-"
+-	create_frame $FUNCTION 1920 1080 mjpeg m "333333
++	# Advertise exactly the resolutions from the persistent config (space-
++	# separated WxH in ISIGHT_RESOLUTIONS, populated by isight-config-apply).
++	# Restricting the advertised modes is the point: the host can only request
++	# what we list here. Falls back to the proven 720p+1080p pair when the
++	# config is missing or empty. All frames share the same 30 fps interval.
++	for _res in ${ISIGHT_RESOLUTIONS:-1280x720 1920x1080}; do
++		_w=${_res%x*}
++		_h=${_res#*x}
++		create_frame $FUNCTION "$_w" "$_h" mjpeg m "333333
+ "
++	done
+ 
+-	# Prefer the proven 1280x720 MJPEG frame (index 2) as the default frame.
+-	# The 640x480 default (index 1) does not negotiate cleanly on macOS, which
+-	# breaks hosts (e.g. QuickTime) that follow the advertised default frame.
+-	# Frame indices are assigned by creation order and are unaffected by this.
++	# Default to the first advertised frame (index 1). macOS follows the
++	# advertised default frame; the config lists 720p first by default.
+ 	# Must be written BEFORE the format is linked into the header below: the
+ 	# kernel returns -EBUSY once the format is linked.
+-	echo 2 > functions/$FUNCTION/streaming/mjpeg/m/bDefaultFrameIndex
++	echo 1 > functions/$FUNCTION/streaming/mjpeg/m/bDefaultFrameIndex
+ 
+ 	mkdir functions/$FUNCTION/streaming/header/h
+ 	cd functions/$FUNCTION/streaming/header/h

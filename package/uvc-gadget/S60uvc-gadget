@@ -11,6 +11,13 @@ UVC_GADGET_ARGS=""
 start() {
 	printf 'Starting %s: ' "$DAEMON"
 
+	# Apply persisted config (config.json on the FAT boot partition) into the
+	# environment: the gadget setup reads ISIGHT_RESOLUTIONS, the daemon reads
+	# ISIGHT_FOV. Best-effort; missing/invalid config falls back to defaults and
+	# never blocks the camera.
+	isight-config-apply 2>/dev/null
+	[ -f /run/isight.env ] && { set -a; . /run/isight.env; set +a; }
+
 	if ! sh "$SETUP" start > /dev/null 2>&1; then
 		echo "FAIL"
 		return 1
@@ -25,6 +32,11 @@ start() {
 	"/usr/bin/$DAEMON" -c 0 uvc.0 -p "23 24 26" $UVC_GADGET_ARGS \
 		< /dev/null > /tmp/uvc-gadget.log 2>&1 &
 	echo $! > "$PIDFILE"
+
+	# Apply the rear logo mode AFTER the daemon starts (it drives GPIO 23 high
+	# at init); isight-logo overrides it per config (off/on/activity).
+	( sleep 1; isight-logo "${ISIGHT_LOGO:-activity}" ) >/dev/null 2>&1 &
+
 	status=$?
 	if [ "$status" -eq 0 ]; then
 		echo "OK"
