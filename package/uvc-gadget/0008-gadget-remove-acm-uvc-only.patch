@@ -1,0 +1,25 @@
+gadget: remove CDC ACM from the composite (UVC only)
+
+Opening the ACM tty from the host was reproducibly observed to transition the
+shared BCM2835 DWC2 gadget into a persistent bad UVC isochronous state (choppy
+video / -ENODATA), on both the baseline and later builds. Remove the ACM
+function/endpoints entirely so the host cannot enumerate/open it.
+
+Signed-off-by: webcampi <webcampi@localhost>
+
+--- a/scripts/uvc-gadget.sh
++++ b/scripts/uvc-gadget.sh
+@@ -174,10 +174,9 @@
+ 	mkdir configs/c.1
+ 	mkdir configs/c.1/strings/0x409
+ 
+-        echo "Creating serial console..."
+-        mkdir functions/acm.usb0
+-        ln -s functions/acm.usb0 configs/c.1/
+-        echo "OK"
++	# No CDC ACM serial console: opening the ACM tty from the host was shown to
++	# persistently degrade UVC isochronous streaming on the shared DWC2 gadget.
++	# Composite is UVC only for this step.
+ 
+ 	echo "Creating functions..."
+ 	create_uvc configs/c.1 uvc.0

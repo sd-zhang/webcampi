@@ -11,7 +11,6 @@ if ! grep -xq "$CONFIGFS" "$FSTAB"; then
 	echo "$CONFIGFS" >> "$FSTAB"
 fi
 
-# Debug shell over USB CDC ACM
-if ! grep -q "^ttyGS0:" "${TARGET_DIR}/etc/inittab"; then
-    echo "ttyGS0::respawn:/sbin/getty -L -n -l /bin/sh ttyGS0 115200 vt100" >> "${TARGET_DIR}/etc/inittab"
-fi
+# No CDC ACM serial console in this composite (opening the ACM tty was shown to
+# persistently degrade UVC). Ensure no getty on the now-absent ttyGS0.
+sed -i '/^ttyGS0:/d' "${TARGET_DIR}/etc/inittab"
