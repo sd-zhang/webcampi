@@ -1,6 +1,6 @@
 # Webcam Pi
 
-An embedded Linux image that turns your Raspberry Pi Zero 2 W and camera module into a plug-and-play USB webcam.
+An embedded Linux image that turns a Raspberry Pi Zero (v1.3, BCM2835/ARMv6) and camera module into a plug-and-play USB webcam with **hardware-accelerated MJPEG encoding**.
 
 ## Table of Contents
 
@@ -10,15 +10,16 @@ An embedded Linux image that turns your Raspberry Pi Zero 2 W and camera module 
 4. [Installation](#installation)
 5. [Setup](#setup)
 6. [Usage](#usage)
-7. [Building](#building)
-8. [Credits](#credits)
+7. [Configuration](#configuration)
+8. [Building](#building)
+9. [Credits](#credits)
 
 ## Required Hardware
 
-| Part                    | Description           |
-| ----------------------- | --------------------- |
-| Raspberry Pi Zero 2 W   | Main compute module   |
-| Supported camera sensor | CSI-2 camera module   |
+| Part                    | Description                        |
+| ----------------------- | ---------------------------------- |
+| Raspberry Pi Zero (v1.3)| Main compute module (BCM2835/ARMv6)|
+| Supported camera sensor | CSI-2 camera module                |
 | microSD card (≥100 MB)  | System storage        |
 | Micro-USB cable         | USB-OTG data & power  |
 | Case (optional)         | Protection & mounting |
@@ -38,14 +39,16 @@ An embedded Linux image that turns your Raspberry Pi Zero 2 W and camera module 
 
 ## Features
 
+- **Hardware MJPEG encoding:** This image specifically targets the original single-core **Pi Zero** (ARM1176 / ARMv6), which is far too slow to compress 720p/1080p video in software. Instead, camera frames are JPEG-compressed by the Pi's **VideoCore hardware encoder** (the `bcm2835-codec` block on `/dev/video11`) and streamed as MJPEG. The frames are handed to the encoder **zero-copy over DMA-BUF**, straight from the camera ISP, so the ARM CPU never touches pixel data and stays nearly idle while streaming. A libjpeg software path exists only as a fallback if no hardware encoder is found.
+- **Runtime configuration:** Resolution, field of view, JPEG quality and the status LED are read at boot from a plain-text file on the SD card's boot partition — editable from any Mac/PC, no rebuild or shell required. See [Configuration](#configuration).
 - **Fast boot:** Less than 6 seconds to go from plugged in to functional.
-- **Running status:** [GPIO 23](https://pinout.xyz/pinout/pin16_gpio23) goes `HIGH` whenever uvc-gadget is active.
+- **Running status:** [GPIO 23](https://pinout.xyz/pinout/pin16_gpio23) goes `HIGH` whenever uvc-gadget is active (also drives the optional logo LED; see `logo_light`).
 - **Streaming status:** [GPIO 24](https://pinout.xyz/pinout/pin18_gpio24) goes `HIGH` whenever video is being streamed to host.
 - **Pause/resume:** [GPIO 26](https://pinout.xyz/pinout/pin37_gpio26) freezes video on `HIGH` while keeping the stream alive.
 
 ## Installation
 
-1. Download the latest image from the [Releases](https://github.com/elcalzado/webcampi/releases) page.
+1. Download the latest image from the [Releases](https://github.com/sd-zhang/webcampi/releases) page.
 2. Insert your microSD card into your host computer.
 3. Flash the image:
 	- Linux/macOS:
@@ -86,6 +89,28 @@ vlc v4l2:///dev/video0
 ffmpeg -f v4l2 -i /dev/video0 -t 00:00:10 output.mkv
 ```
 
+## Configuration
+
+The camera reads its settings at boot from **`isight.json` on the FAT boot partition** — the same volume your host mounts when you plug the SD card into a Mac or PC. Edit the file, save, eject, and reboot the Pi; there is no web UI or login required. The file is created with defaults on first boot, and if it is ever missing or invalid the camera falls back to safe built-in values and still boots.
+
+Default `isight.json`:
+
+```json
+{
+  "resolutions": ["1280x720", "1920x1080"],
+  "fov": 75,
+  "logo_light": "activity",
+  "quality": 72
+}
+```
+
+| Key           | Values                       | Default                        | Description |
+| ------------- | ---------------------------- | ------------------------------ | ----------- |
+| `resolutions` | list of `"WxH"`              | `["1280x720","1920x1080"]`     | The MJPEG modes advertised to the host over USB. The host can only select from this list; the first entry is the default mode. |
+| `fov`         | integer degrees              | `75`                           | Field of view. The full sensor is ~75°; a smaller value crops the centre via the ISP for an optical-style zoom at no CPU cost. `75` or higher keeps the full frame. |
+| `quality`     | `1`–`100`                    | `72`                           | JPEG quality handed to the hardware encoder. Higher means better image quality and larger frames. |
+| `logo_light`  | `off` / `on` / `activity`    | `activity`                     | Optional rear logo LED on GPIO 23. `activity` mirrors the streaming indicator (GPIO 24); `on`/`off` hold it steady. |
+
 ## Building
 
 ### Prerequisites
@@ -96,7 +121,7 @@ ffmpeg -f v4l2 -i /dev/video0 -t 00:00:10 output.mkv
 ### Clone
 
 ```bash
-git clone --recursive https://github.com/elcalzado/webcampi.git
+git clone --recursive https://github.com/sd-zhang/webcampi.git
 cd webcampi
 ```
 
