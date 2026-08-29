@@ -1,0 +1,72 @@
+mjpeg: take JPEG quality from the persistent config
+
+Read ISIGHT_QUALITY (1-100, populated by isight-config-apply from config.json on
+the FAT boot partition) and use it for both encode paths: it is passed to
+HwMjpegEncoder::Create() so the bcm2835 hardware encoder's V4L2 JPEG-quality
+control is set, and it replaces the hard-coded quality in the libjpeg software
+fallback. Defaults to 72 when unset or out of range. Pairs with the kernel patch
+that exposes V4L2_CID_JPEG_COMPRESSION_QUALITY on the video ENCODE role.
+
+Signed-off-by: webcampi <webcampi@localhost>
+
+--- a/include/uvcgadget/mjpeg_encoder.hpp
++++ b/include/uvcgadget/mjpeg_encoder.hpp
+@@ -63,6 +63,8 @@
+ 	 */
+ 	std::unique_ptr<HwMjpegEncoder> hw_encoder_;
+ 	int num_encode_threads_;
++	/* JPEG quality (1-100) from ISIGHT_QUALITY; used by hw and sw paths. */
++	int quality_;
+ 
+ 	struct EncodeItem
+ 	{
+--- a/lib/mjpeg_encoder.cpp
++++ b/lib/mjpeg_encoder.cpp
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <chrono>
++#include <cstdlib>
+ #include <iostream>
+ #include <pthread.h>
+ 
+@@ -31,14 +32,27 @@
+ 	 * get one, a single worker thread drives it serially; otherwise we fall
+ 	 * back to the multi-threaded libjpeg software path.
+ 	 */
+-	hw_encoder_ = HwMjpegEncoder::Create();
++	/*
++	 * JPEG quality (1-100) from the persistent config (ISIGHT_QUALITY, set by
++	 * isight-config-apply). Drives both the bcm2835 hardware encoder's V4L2
++	 * JPEG-quality control and the libjpeg software fallback. Defaults to 72.
++	 */
++	quality_ = 72;
++	if (const char *q = getenv("ISIGHT_QUALITY")) {
++		int v = atoi(q);
++		if (v >= 1 && v <= 100)
++			quality_ = v;
++	}
++
++	hw_encoder_ = HwMjpegEncoder::Create(quality_);
+ 	if (hw_encoder_) {
+ 		num_encode_threads_ = 1;
+ 		std::cout << "MJPEG encoder: using bcm2835 hardware encoder ("
+-			  << hw_encoder_->DevicePath() << ")" << std::endl;
++			  << hw_encoder_->DevicePath() << "), quality " << quality_
++			  << std::endl;
+ 	} else {
+ 		std::cout << "MJPEG encoder: hardware encoder unavailable, "
+-			     "using libjpeg" << std::endl;
++			     "using libjpeg, quality " << quality_ << std::endl;
+ 	}
+ 
+ 	output_thread_ = std::thread(&MjpegEncoder::outputThread, this);
+@@ -77,7 +91,7 @@
+ 
+ 	jpeg_set_defaults(&cinfo);
+ 	cinfo.raw_data_in = TRUE;
+-	jpeg_set_quality(&cinfo, 50, TRUE);
++	jpeg_set_quality(&cinfo, quality_, TRUE);
+ 
+ 	jpeg_mem_len_t jpeg_mem_len = buffer_len;
+ 	jpeg_mem_dest(&cinfo, &encoded_buffer, &jpeg_mem_len);

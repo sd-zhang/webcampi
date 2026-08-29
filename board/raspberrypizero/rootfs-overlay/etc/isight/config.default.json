@@ -1,5 +1,9 @@
 {
-  "resolutions": ["1280x720", "1920x1080"],
+  "resolutions": [
+    "1280x720",
+    "1920x1080"
+  ],
   "fov": 75,
-  "logo_light": "activity"
+  "logo_light": "activity",
+  "quality": 72
 }

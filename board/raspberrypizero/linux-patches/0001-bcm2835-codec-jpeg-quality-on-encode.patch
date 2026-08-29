@@ -1,0 +1,40 @@
+bcm2835-codec: expose JPEG quality on the video ENCODE role
+
+V4L2_CID_JPEG_COMPRESSION_QUALITY was only registered for the ENCODE_IMAGE
+role (the still-JPEG node, /dev/video31), so continuous MJPEG produced by the
+video ENCODE role (/dev/video11, V4L2_PIX_FMT_MJPEG -> MMAL_ENCODING_MJPEG) had
+no quality knob and ran at the VideoCore firmware default. Register the same
+control on the ENCODE role. The existing s_ctrl handler already maps it to
+MMAL_PARAMETER_JPEG_Q_FACTOR on the output port, which the firmware honours for
+MJPEG and ignores for H264, so this is safe for both output formats.
+
+Signed-off-by: webcampi <webcampi@localhost>
+
+--- a/drivers/staging/vc04_services/bcm2835-codec/bcm2835-v4l2-codec.c
++++ b/drivers/staging/vc04_services/bcm2835-codec/bcm2835-v4l2-codec.c
+@@ -3427,7 +3427,7 @@
+ 	case ENCODE:
+ 	{
+ 		/* Encode controls */
+-		v4l2_ctrl_handler_init(hdl, 13);
++		v4l2_ctrl_handler_init(hdl, 14);
+ 
+ 		v4l2_ctrl_new_std_menu(hdl, &bcm2835_codec_ctrl_ops,
+ 				       V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+@@ -3495,6 +3495,16 @@
+ 		ctx->gop_size = v4l2_ctrl_new_std(hdl, &bcm2835_codec_ctrl_ops,
+ 						  V4L2_CID_MPEG_VIDEO_GOP_SIZE,
+ 						  0, 0x7FFFFFFF, 1, 60);
++		/*
++		 * MJPEG (V4L2_PIX_FMT_MJPEG) shares the video ENCODE component, so
++		 * expose the JPEG quality control here too. s_ctrl already maps it to
++		 * MMAL_PARAMETER_JPEG_Q_FACTOR on the output port; the firmware honours
++		 * it for MJPEG and ignores it for H264. Without this the ENCODE node
++		 * ran MJPEG at the firmware default quality with no way to change it.
++		 */
++		v4l2_ctrl_new_std(hdl, &bcm2835_codec_ctrl_ops,
++				  V4L2_CID_JPEG_COMPRESSION_QUALITY,
++				  1, 100, 1, 80);
+ 		if (hdl->error) {
+ 			rc = hdl->error;
+ 			goto free_ctrl_handler;

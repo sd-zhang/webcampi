@@ -28,8 +28,13 @@ case "$fov" in ''|*[!0-9]*) fov=75 ;; esac
 logo=$(jq -r '.logo_light // "activity"' "$src" 2>/dev/null)
 case "$logo" in off|on|activity) ;; *) logo=activity ;; esac
 
+quality=$(jq -r '.quality // 72' "$src" 2>/dev/null)
+case "$quality" in ''|*[!0-9]*) quality=72 ;; esac
+{ [ "$quality" -ge 1 ] && [ "$quality" -le 100 ]; } 2>/dev/null || quality=72
+
 cat > "$OUT" <<EOT
 ISIGHT_RESOLUTIONS="$res"
 ISIGHT_FOV=$fov
 ISIGHT_LOGO=$logo
+ISIGHT_QUALITY=$quality
 EOT
