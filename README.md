@@ -148,6 +148,13 @@ buildroot/output/images/sdcard.img
 
 Flash it as described in [Installation](#installation).
 
+The Pi Zero has a single USB device controller. Keep the kernel's legacy
+`CONFIG_USB_AUDIO` and `CONFIG_USB_MIDI_GADGET` gadgets disabled so the
+configfs UVC/UAC2 gadget can claim it at boot. If a host shows only inactive
+audio devices and no camera, check the boot log for `g_audio` binding the
+controller and the UVC setup failing with `Device or resource busy`;
+changing `isight.json` cannot resolve that kernel configuration conflict.
+
 ## Credits
 
 - [uvc-gadget](https://github.com/elcalzado/uvc-gadget): Fork of the main uvc-gadget with added GPIO functionality.

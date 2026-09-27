@@ -679,6 +679,10 @@ CONFIG_SND_BCM2835_SOC_I2S=y
 CONFIG_SND_SIMPLE_CARD=y
 CONFIG_SND_SOC_ICS43432=y
 CONFIG_USB_CONFIGFS_F_UAC2=y
+# The Pi Zero has one UDC. Built-in legacy gadgets bind it before the
+# configfs UVC/UAC2 gadget can start, leaving the camera unavailable.
+# CONFIG_USB_AUDIO is not set
+# CONFIG_USB_MIDI_GADGET is not set
 
 # Disable the other bcmrpi audio HATs/codecs: only the ICS43434 input is wired.
 # CONFIG_SND_OSSEMUL is not set
