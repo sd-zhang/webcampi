@@ -54,7 +54,7 @@ index 3497c49..f853d94 100644
  int video_source_export_buffers(struct video_source *src,
  				struct video_buffer_set **buffers);
 diff --git a/lib/libcamera-source.cpp b/lib/libcamera-source.cpp
-index ce4cc72..dd11701 100644
+index ce4cc72..a1e5c5b 100644
 --- a/lib/libcamera-source.cpp
 +++ b/lib/libcamera-source.cpp
 @@ -8,6 +8,7 @@
@@ -187,12 +187,12 @@ index ce4cc72..dd11701 100644
 -				}
 +				float scale = tanf(full_fov / 2.0f * pi / 180.0f) /
 +					      tanf(deg / 2.0f * pi / 180.0f);
-+				src->zoom = std::min(350U, (unsigned int)(scale * 100.0f + 0.5f));
++				src->zoom = (std::min)(350U, (unsigned int)(scale * 100.0f + 0.5f));
  			}
  		}
 +		const char *ev = getenv("ISIGHT_EV");
 +		if (ev)
-+			src->ev_tenths = std::max(-20, std::min(20, (int)roundf(atof(ev) * 10.0f)));
++			src->ev_tenths = (std::max)(-20, (std::min)(20, (int)roundf(atof(ev) * 10.0f)));
  	}
  
  	return &src->src;

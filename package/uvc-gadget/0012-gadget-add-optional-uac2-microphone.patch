@@ -6,7 +6,7 @@ cannot bind the composite, retry with UVC alone so video remains available.
 
 --- a/scripts/uvc-gadget.sh
 +++ b/scripts/uvc-gadget.sh
-@@ -177,7 +177,29 @@
+@@ -184,9 +184,31 @@
  	echo "Creating functions..."
  	create_uvc configs/c.1 uvc.0
  	echo "OK"
@@ -37,7 +37,9 @@ cannot bind the composite, retry with UVC alone so video remains available.
 +		fi
 +	fi
  	echo "OK"
-@@ -205,4 +225,8 @@
+ 	;;
+ 
+@@ -206,6 +228,10 @@
  	grep $UDC UDC && echo "" > UDC
  	echo "OK"
  
@@ -46,3 +48,5 @@ cannot bind the composite, retry with UVC alone so video remains available.
 +		rmdir functions/uac2.0
 +	fi
  	delete_uvc configs/c.1 uvc.0
+ 
+ 	echo "Clearing English strings"
