@@ -11,16 +11,16 @@ cannot bind the composite, retry with UVC alone so video remains available.
  	create_uvc configs/c.1 uvc.0
  	echo "OK"
 +	# The device-side UAC2 playback PCM receives the I2S mic through alsaloop.
-+	# c_* describes capture on the USB host; p_* disables host playback.
++	# p_* is USB IN (host microphone); c_* is USB OUT (host playback).
 +	if [ "${ISIGHT_MICROPHONE:-on}" != off ]; then
 +		echo "Creating UAC2 microphone..."
 +		mkdir functions/uac2.0
-+		echo 1 > functions/uac2.0/c_chmask
-+		echo 48000 > functions/uac2.0/c_srate
-+		echo 2 > functions/uac2.0/c_ssize
++		echo 1 > functions/uac2.0/p_chmask
++		echo 48000 > functions/uac2.0/p_srate
++		echo 2 > functions/uac2.0/p_ssize
 +		# Let the host's normal microphone controls mute capture.
-+		[ ! -e functions/uac2.0/c_mute_present ] || echo 1 > functions/uac2.0/c_mute_present
-+		echo 0 > functions/uac2.0/p_chmask
++		[ ! -e functions/uac2.0/p_mute_present ] || echo 1 > functions/uac2.0/p_mute_present
++		echo 0 > functions/uac2.0/c_chmask
 +		ln -s functions/uac2.0 configs/c.1/uac2.0
 +	fi
  
