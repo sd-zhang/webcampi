@@ -1,0 +1,23 @@
+From: PiSight <pisight@localhost>
+Subject: [PATCH] cmake: exclude GHS generator header from bootstrap
+
+The bootstrap executable does not link the GHS generator implementation.
+Including its header on Linux instantiates factory methods that reference
+unlinked symbols, so host-cmake fails to link. The full CMake build still
+includes the generator normally.
+
+--- a/Source/cmake.cxx
++++ b/Source/cmake.cxx
+@@ -129,8 +129,10 @@
+ 
+ // NOTE: the __linux__ macro is predefined on Android host too, but
+ // main CMakeLists.txt filters out this generator by host name.
+-#if (defined(__linux__) && !defined(__ANDROID__)) || defined(_WIN32)
+-#  include "cmGlobalGhsMultiGenerator.h"
++#if !defined(CMAKE_BOOTSTRAP)
++#  if (defined(__linux__) && !defined(__ANDROID__)) || defined(_WIN32)
++#    include "cmGlobalGhsMultiGenerator.h"
++#  endif
+ #endif
+ 
+ #if defined(__APPLE__)

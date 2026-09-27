@@ -1,0 +1,48 @@
+gadget: expose optional mono UAC2 microphone after UVC
+
+Keep UVC first so its interface numbering stays stable. The microphone can be
+disabled in isight.json without rebuilding or reflashing. If the DWC2 controller
+cannot bind the composite, retry with UVC alone so video remains available.
+
+--- a/scripts/uvc-gadget.sh
++++ b/scripts/uvc-gadget.sh
+@@ -177,7 +177,29 @@
+ 	echo "Creating functions..."
+ 	create_uvc configs/c.1 uvc.0
+ 	echo "OK"
++	# The device-side UAC2 playback PCM receives the I2S mic through alsaloop.
++	# c_* describes capture on the USB host; p_* disables host playback.
++	if [ "${ISIGHT_MICROPHONE:-on}" != off ]; then
++		echo "Creating UAC2 microphone..."
++		mkdir functions/uac2.0
++		echo 1 > functions/uac2.0/c_chmask
++		echo 48000 > functions/uac2.0/c_srate
++		echo 2 > functions/uac2.0/c_ssize
++		# Let the host's normal microphone controls mute capture.
++		[ ! -e functions/uac2.0/c_mute_present ] || echo 1 > functions/uac2.0/c_mute_present
++		echo 0 > functions/uac2.0/p_chmask
++		ln -s functions/uac2.0 configs/c.1/uac2.0
++	fi
+ 
+ 	echo "Binding USB Device Controller"
+-	echo $UDC > UDC
++	if ! echo "$UDC" > UDC; then
++		# Keep the camera usable if audio consumes an unavailable endpoint.
++		if [ -L configs/c.1/uac2.0 ]; then
++			rm configs/c.1/uac2.0
++			rmdir functions/uac2.0
++			echo "$UDC" > UDC
++		else
++			exit 1
++		fi
++	fi
+ 	echo "OK"
+@@ -205,4 +225,8 @@
+ 	grep $UDC UDC && echo "" > UDC
+ 	echo "OK"
+ 
++	if [ -L configs/c.1/uac2.0 ]; then
++		rm configs/c.1/uac2.0
++		rmdir functions/uac2.0
++	fi
+ 	delete_uvc configs/c.1 uvc.0

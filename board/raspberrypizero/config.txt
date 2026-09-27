@@ -14,6 +14,9 @@ dtoverlay=vc4-kms-v3d
 # Enable peripheral mode
 dtoverlay=dwc2,dr_mode=peripheral
 
+# ICS43434 I2S microphone on the standard PCM pins (left slot)
+dtoverlay=pisight-ics43434
+
 # Disable the built-in LED
 dtparam=act_led_trigger=none
 dtparam=act_led_activelow=on

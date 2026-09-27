@@ -1,0 +1,39 @@
+#!/bin/sh
+# Bridge the physical I2S capture card to the UAC2 gadget's playback PCM.
+PIDFILE=/var/run/pisight-mic.pid
+LOG=/tmp/pisight-mic.log
+UAC2=/sys/kernel/config/usb_gadget/g1/configs/c.1/uac2.0
+
+start() {
+	# S60uvc-gadget has already decided whether audio can be advertised.
+	[ -L "$UAC2" ] || return 0
+	printf 'Starting PiSight microphone: '
+	(
+		# Card registration may finish just after the gadget is bound.
+		attempt=0
+		while [ ! -e /proc/asound/PiSightMic ] || [ ! -e /proc/asound/UAC2Gadget ]; do
+			attempt=$((attempt + 1))
+			[ "$attempt" -lt 10 ] || { echo "ALSA cards did not appear"; exit 1; }
+			sleep 1
+		done
+		exec alsaloop -C pisight_mic -P hw:CARD=UAC2Gadget,DEV=0 \
+			-f S16_LE -c 1 -r 48000 -t 50000 -n
+	) > "$LOG" 2>&1 &
+	echo $! > "$PIDFILE"
+	echo OK
+}
+
+stop() {
+	[ -f "$PIDFILE" ] || return 0
+	printf 'Stopping PiSight microphone: '
+	kill "$(cat "$PIDFILE")" 2>/dev/null || true
+	rm -f "$PIDFILE"
+	echo OK
+}
+
+case "$1" in
+	start) start ;;
+	stop) stop ;;
+	restart|reload) stop; start ;;
+	*) echo "Usage: $0 {start|stop|restart|reload}"; exit 1 ;;
+esac

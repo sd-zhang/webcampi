@@ -7,6 +7,11 @@ BOARD_NAME="$(basename ${BOARD_DIR})"
 GENIMAGE_CFG="${BOARD_DIR}/genimage-${BOARD_NAME}.cfg"
 GENIMAGE_TMP="${BUILD_DIR}/genimage.tmp"
 
+# Firmware looks for dtoverlay=pisight-ics43434 under /overlays on the FAT
+# partition. Buildroot puts custom .dtbo files at the top of BINARIES_DIR.
+mkdir -p "${BINARIES_DIR}/rpi-firmware/overlays"
+cp "${BINARIES_DIR}/pisight-ics43434.dtbo" "${BINARIES_DIR}/rpi-firmware/overlays/"
+
 # generate genimage from template if a board specific variant doesn't exists
 if [ ! -e "${GENIMAGE_CFG}" ]; then
 	GENIMAGE_CFG="${BINARIES_DIR}/genimage.cfg"

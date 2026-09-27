@@ -1,0 +1,38 @@
+#!/bin/sh
+# Persist a validated UVC settings payload to the FAT boot partition.
+# Usage: isight-config-store FOV_DEGREES EV_TENTHS LOGO_MODE MIC_ENABLED
+set -eu
+
+[ "$#" -eq 4 ] || exit 2
+fov=$1 ev_tenths=$2 logo=$3 mic=$4
+case "$fov" in ''|*[!0-9]*) exit 2 ;; esac
+case "$ev_tenths" in -[0-9]*|[0-9]*) ;; *) exit 2 ;; esac
+case "$logo" in off|on|activity) ;; *) exit 2 ;; esac
+case "$mic" in 0|1) ;; *) exit 2 ;; esac
+[ "$fov" -ge 25 ] && [ "$fov" -le 75 ] || exit 2
+[ "$ev_tenths" -ge -20 ] && [ "$ev_tenths" -le 20 ] || exit 2
+
+boot=/boot
+config=$boot/isight.json
+default=/etc/isight/config.default.json
+grep -q " $boot " /proc/mounts || exit 1
+source=$default
+[ -f "$config" ] && jq -e . "$config" >/dev/null 2>&1 && source=$config
+
+mount -o remount,rw "$boot"
+tmp=$(mktemp "$boot/.isight.XXXXXX") || { mount -o remount,ro "$boot"; exit 1; }
+cleanup() {
+	rm -f "$tmp"
+	mount -o remount,ro "$boot" || true
+}
+trap cleanup EXIT HUP INT TERM
+
+if [ "$mic" -eq 1 ]; then mic_json=true; else mic_json=false; fi
+jq --argjson fov "$fov" --argjson ev "$ev_tenths" \
+   --arg logo "$logo" --argjson mic "$mic_json" \
+   '.fov = $fov | .ev = ($ev / 10) | .logo_light = $logo | .microphone = $mic' \
+   "$source" > "$tmp"
+jq -e . "$tmp" >/dev/null
+mv -f "$tmp" "$config"
+mount -o remount,ro "$boot"
+trap - EXIT HUP INT TERM

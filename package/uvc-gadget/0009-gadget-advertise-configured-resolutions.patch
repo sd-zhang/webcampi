@@ -4,7 +4,7 @@ Replace the three hard-coded MJPEG frame sizes with a loop over
 ISIGHT_RESOLUTIONS (space-separated WxH, populated by isight-config-apply from
 config.json on the FAT boot partition). Restricting the advertised modes is the
 point of the setting: the host can only request what the gadget lists. Falls
-back to the proven 1280x720 + 1920x1080 pair when the config is absent or empty,
+back to 1280x720 + 1920x1080 + 1280x960 when the config is absent or empty,
 and defaults to the first advertised frame (index 1) for macOS.
 
 Signed-off-by: webcampi <webcampi@localhost>
@@ -23,9 +23,9 @@ Signed-off-by: webcampi <webcampi@localhost>
 +	# Advertise exactly the resolutions from the persistent config (space-
 +	# separated WxH in ISIGHT_RESOLUTIONS, populated by isight-config-apply).
 +	# Restricting the advertised modes is the point: the host can only request
-+	# what we list here. Falls back to the proven 720p+1080p pair when the
++	# what we list here. Falls back to 720p, 1080p, and 960p when the
 +	# config is missing or empty. All frames share the same 30 fps interval.
-+	for _res in ${ISIGHT_RESOLUTIONS:-1280x720 1920x1080}; do
++	for _res in ${ISIGHT_RESOLUTIONS:-1280x720 1920x1080 1280x960}; do
 +		_w=${_res%x*}
 +		_h=${_res#*x}
 +		create_frame $FUNCTION "$_w" "$_h" mjpeg m "333333

@@ -1,5 +1,5 @@
 #!/bin/sh
-# isight-config-apply - translate the persistent config (config.json on the FAT
+# isight-config-apply - translate the persistent config (isight.json on the FAT
 # boot partition, editable from any host) into /run/isight.env for the gadget
 # script + camera daemon. Best-effort: any failure falls back to compiled
 # defaults and never blocks the camera.
@@ -22,9 +22,12 @@ src=$DEFAULT
 [ -f "$CFG" ] && jq -e . "$CFG" >/dev/null 2>&1 && src=$CFG
 
 res=$(jq -r '.resolutions[]? // empty' "$src" 2>/dev/null | grep -E '^[0-9]+x[0-9]+$' | tr '\n' ' ')
-[ -n "$res" ] || res="1280x720 1920x1080"
+[ -n "$res" ] || res="1280x720 1920x1080 1280x960"
 fov=$(jq -r '.fov // 75' "$src" 2>/dev/null)
 case "$fov" in ''|*[!0-9]*) fov=75 ;; esac
+{ [ "$fov" -ge 25 ] && [ "$fov" -le 75 ]; } 2>/dev/null || fov=75
+ev=$(jq -r 'if (.ev | type) == "number" and .ev >= -2 and .ev <= 2 then .ev else 0 end' "$src" 2>/dev/null)
+[ -n "$ev" ] || ev=0
 logo=$(jq -r '.logo_light // "activity"' "$src" 2>/dev/null)
 case "$logo" in off|on|activity) ;; *) logo=activity ;; esac
 
@@ -32,9 +35,16 @@ quality=$(jq -r '.quality // 72' "$src" 2>/dev/null)
 case "$quality" in ''|*[!0-9]*) quality=72 ;; esac
 { [ "$quality" -ge 1 ] && [ "$quality" -le 100 ]; } 2>/dev/null || quality=72
 
+# Only a JSON boolean false disables the microphone. Older config files
+# without this key pick up the new default automatically.
+microphone=$(jq -r 'if .microphone == false then "off" else "on" end' "$src" 2>/dev/null)
+[ "$microphone" = off ] || microphone=on
+
 cat > "$OUT" <<EOT
 ISIGHT_RESOLUTIONS="$res"
 ISIGHT_FOV=$fov
+ISIGHT_EV=$ev
 ISIGHT_LOGO=$logo
 ISIGHT_QUALITY=$quality
+ISIGHT_MICROPHONE=$microphone
 EOT

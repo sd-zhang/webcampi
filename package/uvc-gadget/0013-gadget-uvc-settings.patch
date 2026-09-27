@@ -1,0 +1,552 @@
+uvc: expose standard camera controls and persistent PiSight settings XU
+
+Advertise Zoom Absolute and Brightness, apply changes through libcamera, and
+add one UVC extension control for persistent FOV, EV, logo and mic settings.
+
+diff --git a/include/uvcgadget/stream.h b/include/uvcgadget/stream.h
+index 7894ff7..aa2996c 100644
+--- a/include/uvcgadget/stream.h
++++ b/include/uvcgadget/stream.h
+@@ -10,6 +10,8 @@
+ #ifndef __STREAM_H__
+ #define __STREAM_H__
+ 
++#include "video-source.h"
++
+ struct events;
+ struct uvc_function_config;
+ struct uvc_stream;
+@@ -104,6 +106,7 @@ int uvc_stream_set_format(struct uvc_stream *stream,
+  * Returns 0 on success, or a negative error code on failure.
+  */
+ int uvc_stream_set_frame_rate(struct uvc_stream *stream, unsigned int fps);
++int uvc_stream_set_control(struct uvc_stream *stream, enum video_source_control control, int value);
+ 
+ /*
+  * uvc_stream_enable - Turn on/off video streaming for the UVC stream
+diff --git a/include/uvcgadget/video-source.h b/include/uvcgadget/video-source.h
+index 3497c49..f853d94 100644
+--- a/include/uvcgadget/video-source.h
++++ b/include/uvcgadget/video-source.h
+@@ -15,10 +15,16 @@ struct video_buffer;
+ struct video_buffer_set;
+ struct video_source;
+ 
++enum video_source_control {
++	VIDEO_SOURCE_CTRL_ZOOM,
++	VIDEO_SOURCE_CTRL_EV,
++};
++
+ struct video_source_ops {
+ 	void(*destroy)(struct video_source *src);
+ 	int(*set_format)(struct video_source *src, struct v4l2_pix_format *fmt);
+ 	int(*set_frame_rate)(struct video_source *src, unsigned int fps);
++	int(*set_control)(struct video_source *src, enum video_source_control control, int value);
+ 	int(*alloc_buffers)(struct video_source *src, unsigned int nbufs);
+ 	int(*export_buffers)(struct video_source *src,
+ 			     struct video_buffer_set **buffers);
+@@ -62,6 +68,7 @@ void video_source_destroy(struct video_source *src);
+ int video_source_set_format(struct video_source *src,
+ 			    struct v4l2_pix_format *fmt);
+ int video_source_set_frame_rate(struct video_source *src, unsigned int fps);
++int video_source_set_control(struct video_source *src, enum video_source_control control, int value);
+ int video_source_alloc_buffers(struct video_source *src, unsigned int nbufs);
+ int video_source_export_buffers(struct video_source *src,
+ 				struct video_buffer_set **buffers);
+diff --git a/lib/libcamera-source.cpp b/lib/libcamera-source.cpp
+index ce4cc72..dd11701 100644
+--- a/lib/libcamera-source.cpp
++++ b/lib/libcamera-source.cpp
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <errno.h>
++#include <algorithm>
+ #include <fcntl.h>
+ #include <iostream>
+ #include <memory.h>
+@@ -45,6 +46,9 @@ struct libcamera_source {
+ 	std::unique_ptr<CameraConfiguration> config;
+ 	std::shared_ptr<Camera> camera;
+ 	ControlList controls;
++	Rectangle default_crop;
++	unsigned int zoom = 100; /* UVC Zoom Absolute, 100 = 1x */
++	int ev_tenths = 0;
+ 
+ 	FrameBufferAllocator *allocator;
+ 	std::vector<std::unique_ptr<Request>> requests;
+@@ -245,6 +249,44 @@ static int libcamera_source_set_frame_rate(struct video_source *s, unsigned int
+ 	return 0;
+ }
+ 
++static void libcamera_source_apply_controls(struct libcamera_source *src, ControlList &controls)
++{
++	if (src->default_crop.width && src->default_crop.height &&
++	    src->camera->controls().find(&controls::ScalerCrop) != src->camera->controls().end()) {
++		const Rectangle &base = src->default_crop;
++		unsigned int width = (base.width * 100 / src->zoom) & ~1U;
++		unsigned int height = (base.height * 100 / src->zoom) & ~1U;
++		Rectangle crop(base.x + (base.width - width) / 2,
++			       base.y + (base.height - height) / 2, width, height);
++		controls.set(controls::ScalerCrop, crop);
++	}
++	if (src->camera->controls().find(&controls::ExposureValue) != src->camera->controls().end())
++		controls.set(controls::ExposureValue, src->ev_tenths / 10.0f);
++}
++
++static int libcamera_source_set_control(struct video_source *s,
++					 enum video_source_control control, int value)
++{
++	struct libcamera_source *src = to_libcamera_source(s);
++
++	switch (control) {
++	case VIDEO_SOURCE_CTRL_ZOOM:
++		if (value < 100 || value > 350)
++			return -ERANGE;
++		src->zoom = value;
++		break;
++	case VIDEO_SOURCE_CTRL_EV:
++		if (value < -20 || value > 20)
++			return -ERANGE;
++		src->ev_tenths = value;
++		break;
++	default:
++		return -EINVAL;
++	}
++	libcamera_source_apply_controls(src, src->controls);
++	return 0;
++}
++
+ static int libcamera_source_alloc_buffers(struct video_source *s, unsigned int nbufs)
+ {
+ 	struct libcamera_source *src = to_libcamera_source(s);
+@@ -257,6 +299,10 @@ static int libcamera_source_alloc_buffers(struct video_source *s, unsigned int n
+ 		std::cerr << "failed to configure the camera" << std::endl;
+ 		return ret;
+ 	}
++	const auto crop = src->camera->controls().find(&controls::ScalerCrop);
++	if (crop != src->camera->controls().end())
++		src->default_crop = crop->second.def().get<Rectangle>();
++	libcamera_source_apply_controls(src, src->controls);
+ 
+ 	Stream *stream = src->config->at(0).stream();
+ 	FrameBufferAllocator *allocator;
+@@ -385,6 +431,7 @@ static int libcamera_source_stream_on(struct video_source *s)
+ 	}
+ 
+ 	for (std::unique_ptr<Request> &request : src->requests) {
++		libcamera_source_apply_controls(src, request->controls());
+ 		ret = src->camera->queueRequest(request.get());
+ 		if (ret) {
+ 			std::cerr << "failed to queue request" << std::endl;
+@@ -439,6 +486,7 @@ static int libcamera_source_queue_buffer(struct video_source *s,
+ 	for (std::unique_ptr<Request> &r : src->requests) {
+ 		if (r->cookie() == buf->index) {
+ 			r->reuse(Request::ReuseBuffers);
++			libcamera_source_apply_controls(src, r->controls());
+ 			src->camera->queueRequest(r.get());
+ 
+ 			break;
+@@ -452,6 +500,7 @@ static const struct video_source_ops libcamera_source_ops = {
+ 	.destroy = libcamera_source_destroy,
+ 	.set_format = libcamera_source_set_format,
+ 	.set_frame_rate = libcamera_source_set_frame_rate,
++	.set_control = libcamera_source_set_control,
+ 	.alloc_buffers = libcamera_source_alloc_buffers,
+ 	.export_buffers = libcamera_source_export_buffers,
+ 	.import_buffers = libcamera_source_import_buffers,
+@@ -582,32 +631,20 @@ struct video_source *libcamera_source_create(const char *devname)
+ 			src->controls.set(controls::AfMode, controls::AfModeContinuous);
+ 		}
+ 
+-		/*
+-		 * Field of view from the persistent config (ISIGHT_FOV, degrees).
+-		 * The full sensor is ~75 deg; a narrower value crops the centre via
+-		 * the ISP scaler (no CPU pixel work). >=75 or unset leaves full FOV.
+-		 */
++		/* Translate the legacy FOV setting to the UVC zoom scale. */
+ 		const char *fov = getenv("ISIGHT_FOV");
+-		if (fov && infoMap.find(&controls::ScalerCrop) != infoMap.end()) {
++		if (fov) {
+ 			const float full_fov = 75.0f, pi = 3.14159265f;
+ 			float deg = (float)atof(fov);
+ 			if (deg > 0.0f && deg < full_fov) {
+-				const auto area = src->camera->properties().get(properties::ScalerCropMaximum);
+-				if (area) {
+-					float zoom = tanf(full_fov / 2.0f * pi / 180.0f) /
+-						     tanf(deg / 2.0f * pi / 180.0f);
+-					if (zoom < 1.0f) zoom = 1.0f;
+-					if (zoom > 3.0f) zoom = 3.0f;
+-					Rectangle full = *area;
+-					unsigned int w = (unsigned int)(full.width / zoom);
+-					unsigned int h = (unsigned int)(full.height / zoom);
+-					Rectangle crop(full.x + (int)((full.width - w) / 2),
+-						       full.y + (int)((full.height - h) / 2), w, h);
+-					src->controls.set(controls::ScalerCrop, crop);
+-					std::cout << "FOV: " << deg << " deg (zoom " << zoom << ")" << std::endl;
+-				}
++				float scale = tanf(full_fov / 2.0f * pi / 180.0f) /
++					      tanf(deg / 2.0f * pi / 180.0f);
++				src->zoom = std::min(350U, (unsigned int)(scale * 100.0f + 0.5f));
+ 			}
+ 		}
++		const char *ev = getenv("ISIGHT_EV");
++		if (ev)
++			src->ev_tenths = std::max(-20, std::min(20, (int)roundf(atof(ev) * 10.0f)));
+ 	}
+ 
+ 	return &src->src;
+diff --git a/lib/stream.c b/lib/stream.c
+index c56a114..4ee9ada 100644
+--- a/lib/stream.c
++++ b/lib/stream.c
+@@ -354,6 +354,11 @@ int uvc_stream_set_frame_rate(struct uvc_stream *stream, unsigned int fps)
+ 	return video_source_set_frame_rate(stream->src, fps);
+ }
+ 
++int uvc_stream_set_control(struct uvc_stream *stream, enum video_source_control control, int value)
++{
++	return video_source_set_control(stream->src, control, value);
++}
++
+ void uvc_stream_set_frozen(void *s, int state)
+ {
+ 	struct uvc_stream *stream = s;
+diff --git a/lib/uvc.c b/lib/uvc.c
+index c70638a..6e721d9 100644
+--- a/lib/uvc.c
++++ b/lib/uvc.c
+@@ -9,6 +9,7 @@
+ 
+ #include <errno.h>
+ #include <limits.h>
++#include <math.h>
+ #include <linux/usb/ch9.h>
+ #include <linux/usb/g_uvc.h>
+ #include <linux/usb/video.h>
+@@ -16,6 +17,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/ioctl.h>
++#include <sys/wait.h>
++#include <unistd.h>
+ 
+ #include "configfs.h"
+ #include "events.h"
+@@ -24,6 +27,7 @@
+ #include "uvc-debug.h"
+ #include "uvc.h"
+ #include "v4l2.h"
++#include "video-source.h"
+ 
+ /*
+  * Fixed UVC interface string indices the gadget kernel normalises wIndex to
+@@ -49,6 +53,14 @@ struct uvc_device
+ 	struct uvc_streaming_control commit;
+ 
+ 	int control;
++	unsigned int control_entity;
++	uint16_t zoom;
++	int16_t brightness;
++	int16_t saved_ev;
++	unsigned int xu_unit;
++	uint8_t fov;
++	uint8_t logo_mode;
++	uint8_t microphone;
+ 
+ 	unsigned int fcc;
+ 	unsigned int width;
+@@ -115,6 +127,38 @@ struct uvc_device *uvc_open(const char *devname, struct uvc_stream *stream)
+ 
+ 	memset(dev, 0, sizeof *dev);
+ 	dev->stream = stream;
++	dev->zoom = 100;
++	dev->fov = 75;
++	dev->logo_mode = 2;
++	dev->microphone = 1;
++	const char *xu_unit = getenv("ISIGHT_XU_UNIT");
++	if (xu_unit) {
++		char *end;
++		unsigned long unit = strtoul(xu_unit, &end, 10);
++		if (*xu_unit && !*end && unit > 2 && unit < 256)
++			dev->xu_unit = unit;
++	}
++	const char *fov = getenv("ISIGHT_FOV");
++	if (fov) {
++		float deg = atof(fov);
++		if (deg > 0.0f && deg < 75.0f) {
++			dev->fov = clamp((int)roundf(deg), 25, 75);
++			float ratio = tanf(37.5f * 3.14159265f / 180.0f) /
++				      tanf(deg * 3.14159265f / 360.0f);
++			dev->zoom = clamp((unsigned int)(ratio * 100.0f + 0.5f), 100U, 350U);
++		}
++	}
++	const char *ev = getenv("ISIGHT_EV");
++	if (ev)
++		dev->brightness = clamp((int)roundf(atof(ev) * 10.0f), -20, 20);
++	dev->saved_ev = dev->brightness;
++	const char *logo = getenv("ISIGHT_LOGO");
++	if (logo) {
++		if (!strcmp(logo, "off")) dev->logo_mode = 0;
++		else if (!strcmp(logo, "on")) dev->logo_mode = 1;
++	}
++	const char *microphone = getenv("ISIGHT_MICROPHONE");
++	if (microphone && !strcmp(microphone, "off")) dev->microphone = 0;
+ 
+ 	dev->vdev = v4l2_open(devname);
+ 	if (dev->vdev == NULL) {
+@@ -205,20 +249,82 @@ uvc_events_process_standard(struct uvc_device *dev,
+ }
+ 
+ static void
+-uvc_events_process_control(struct uvc_device *dev, uint8_t req, uint8_t cs, uint8_t len,
+-			   struct uvc_request_data *resp)
++uvc_events_process_control(struct uvc_device *dev, uint8_t req, uint8_t entity,
++			   uint8_t cs, uint16_t len, struct uvc_request_data *resp)
+ {
+-	printf("control request (req %s cs %s)\n", uvc_request_name(req), pu_control_name(cs));
+-	uvc_log("CONTROL req=%s cs=%s len=%u\n", uvc_request_name(req),
+-		pu_control_name(cs), len);
+-	(void)dev;
++	int value;
++	int minimum;
++	int maximum;
++	int resolution;
++
++	if (dev->xu_unit && entity == dev->xu_unit && cs == 1) {
++		if (req == UVC_SET_CUR && len == 8) {
++			dev->control_entity = entity;
++			dev->control = cs;
++			resp->length = 8;
++		} else if (req == UVC_GET_INFO) {
++			resp->data[0] = 3;
++			resp->length = 1;
++		} else if (req == UVC_GET_LEN) {
++			resp->data[0] = 8;
++			resp->data[1] = 0;
++			resp->length = 2;
++		} else if (req == UVC_GET_CUR || req == UVC_GET_DEF) {
++			resp->data[0] = 1; /* protocol version */
++			resp->data[1] = req == UVC_GET_DEF ? 75 : dev->fov;
++			int ev = req == UVC_GET_DEF ? 0 : dev->saved_ev;
++			resp->data[2] = ev & 0xff;
++			resp->data[3] = (ev >> 8) & 0xff;
++			resp->data[4] = req == UVC_GET_DEF ? 2 : dev->logo_mode;
++			resp->data[5] = req == UVC_GET_DEF ? 1 : dev->microphone;
++			resp->length = len < 8 ? len : 8;
++		}
++		return;
++	}
++	if (entity == 1 && cs == UVC_CT_ZOOM_ABSOLUTE_CONTROL) {
++		value = dev->zoom;
++		minimum = 100;
++		maximum = 350;
++		resolution = 1;
++	} else if (entity == 2 && cs == UVC_PU_BRIGHTNESS_CONTROL) {
++		value = dev->brightness;
++		minimum = -20;
++		maximum = 20;
++		resolution = 1;
++	} else {
++		return; /* Stall controls that are not implemented. */
++	}
+ 
+-	/*
+-	 * Responding to controls is not currently implemented. As an interim
+-	 * measure respond to say that both get and set operations are permitted.
+-	 */
+-	resp->data[0] = 0x03;
+-	resp->length = len;
++	if (req == UVC_SET_CUR) {
++		if (len != 2)
++			return;
++		dev->control = cs;
++		dev->control_entity = entity;
++		resp->length = 2;
++		return;
++	}
++	if (req == UVC_GET_INFO) {
++		resp->data[0] = 0x03;
++		resp->length = 1;
++		return;
++	}
++	if (req == UVC_GET_LEN) {
++		resp->data[0] = 2;
++		resp->data[1] = 0;
++		resp->length = 2;
++		return;
++	}
++	switch (req) {
++	case UVC_GET_MIN: value = minimum; break;
++	case UVC_GET_MAX: value = maximum; break;
++	case UVC_GET_RES: value = resolution; break;
++	case UVC_GET_DEF: value = entity == 1 ? 100 : 0; break;
++	case UVC_GET_CUR: break;
++	default: return;
++	}
++	resp->data[0] = value & 0xff;
++	resp->data[1] = (value >> 8) & 0xff;
++	resp->length = len < 2 ? len : 2;
+ }
+ 
+ static void
+@@ -312,10 +418,12 @@ uvc_events_process_class(struct uvc_device *dev,
+ 	if (interface == UVC_STRING_CONTROL_IDX ||
+ 	    interface == dev->fc->control.intf.bInterfaceNumber) {
+ 		uvc_log("CLASS route=CONTROL\n");
+-		uvc_events_process_control(dev, ctrl->bRequest, ctrl->wValue >> 8, ctrl->wLength, resp);
++		uvc_events_process_control(dev, ctrl->bRequest, ctrl->wIndex >> 8,
++					   ctrl->wValue >> 8, ctrl->wLength, resp);
+ 	} else if (interface == UVC_STRING_STREAMING_IDX ||
+ 		   interface == dev->fc->streaming.intf.bInterfaceNumber) {
+ 		uvc_log("CLASS route=STREAMING\n");
++		dev->control_entity = 0;
+ 		uvc_events_process_streaming(dev, ctrl->bRequest, ctrl->wValue >> 8, resp);
+ 	} else {
+ 		uvc_log("CLASS route=NONE (unmatched interface %u)\n", interface);
+@@ -328,6 +436,7 @@ uvc_events_process_setup(struct uvc_device *dev,
+ 			 struct uvc_request_data *resp)
+ {
+ 	dev->control = 0;
++	dev->control_entity = 0;
+ 
+ 	printf("bRequestType %02x bRequest %02x wValue %04x wIndex %04x "
+ 		"wLength %04x\n", ctrl->bRequestType, ctrl->bRequest,
+@@ -350,10 +459,79 @@ uvc_events_process_setup(struct uvc_device *dev,
+ 	}
+ }
+ 
++static int uvc_store_settings(unsigned int fov, int ev, unsigned int logo,
++			      unsigned int microphone)
++{
++	static const char *const modes[] = { "off", "on", "activity" };
++	char fov_arg[4], ev_arg[5], mic_arg[2];
++	pid_t pid;
++	int status;
++
++	snprintf(fov_arg, sizeof fov_arg, "%u", fov);
++	snprintf(ev_arg, sizeof ev_arg, "%d", ev);
++	snprintf(mic_arg, sizeof mic_arg, "%u", microphone);
++	pid = fork();
++	if (pid == 0) {
++		execl("/usr/bin/isight-config-store", "isight-config-store",
++		      fov_arg, ev_arg, modes[logo], mic_arg, (char *)NULL);
++		_exit(127);
++	}
++	if (pid < 0)
++		return -1;
++	do {
++		if (waitpid(pid, &status, 0) >= 0)
++			break;
++		if (errno != EINTR)
++			return -1;
++	} while (1);
++	return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
++}
++
+ static void
+ uvc_events_process_data(struct uvc_device *dev,
+ 			const struct uvc_request_data *data)
+ {
++	if (dev->control_entity) {
++		if (dev->control_entity == dev->xu_unit && dev->control == 1 &&
++		    data->length == 8) {
++			int ev = (int16_t)(data->data[2] | (data->data[3] << 8));
++			unsigned int fov = data->data[1];
++			unsigned int logo = data->data[4];
++			unsigned int microphone = data->data[5];
++			if (data->data[0] == 1 && fov >= 25 && fov <= 75 &&
++			    ev >= -20 && ev <= 20 && logo <= 2 && microphone <= 1 &&
++			    !data->data[6] && !data->data[7]) {
++				if (!uvc_store_settings(fov, ev, logo, microphone)) {
++					float ratio = tanf(37.5f * 3.14159265f / 180.0f) /
++						tanf(fov * 3.14159265f / 360.0f);
++					unsigned int zoom = clamp((unsigned int)(ratio * 100.0f + 0.5f), 100U, 350U);
++					dev->fov = fov;
++					dev->saved_ev = ev;
++					dev->logo_mode = logo;
++					dev->microphone = microphone;
++					if (!uvc_stream_set_control(dev->stream, VIDEO_SOURCE_CTRL_ZOOM, zoom))
++						dev->zoom = zoom;
++					if (!uvc_stream_set_control(dev->stream, VIDEO_SOURCE_CTRL_EV, ev))
++						dev->brightness = ev;
++				} else {
++					fprintf(stderr, "failed to save PiSight settings\n");
++				}
++			}
++		} else if (data->length == 2 && dev->control_entity != dev->xu_unit) {
++			int raw = data->data[0] | (data->data[1] << 8);
++			int value = dev->control_entity == 2 ? (int16_t)raw : raw;
++			enum video_source_control control = dev->control_entity == 1 ?
++				VIDEO_SOURCE_CTRL_ZOOM : VIDEO_SOURCE_CTRL_EV;
++			if (!uvc_stream_set_control(dev->stream, control, value)) {
++				if (dev->control_entity == 1)
++					dev->zoom = value;
++				else
++					dev->brightness = value;
++			}
++		}
++		dev->control_entity = 0;
++		return;
++	}
+ 	const struct uvc_streaming_control *ctrl =
+ 		(const struct uvc_streaming_control *)&data->data;
+ 	struct uvc_streaming_control *target;
+diff --git a/lib/video-source.c b/lib/video-source.c
+index 78020f2..41710b4 100644
+--- a/lib/video-source.c
++++ b/lib/video-source.c
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include "video-source.h"
++#include <errno.h>
+ 
+ void video_source_set_buffer_handler(struct video_source *src,
+ 				     video_source_buffer_handler_t handler,
+@@ -34,6 +35,13 @@ int video_source_set_frame_rate(struct video_source *src, unsigned int fps)
+ 	return src->ops->set_frame_rate(src, fps);
+ }
+ 
++int video_source_set_control(struct video_source *src, enum video_source_control control, int value)
++{
++	if (!src->ops->set_control)
++		return -ENOTSUP;
++	return src->ops->set_control(src, control, value);
++}
++
+ int video_source_alloc_buffers(struct video_source *src, unsigned int nbufs)
+ {
+ 	return src->ops->alloc_buffers(src, nbufs);
+diff --git a/scripts/uvc-gadget.sh b/scripts/uvc-gadget.sh
+index 65aa123..a0904f9 100755
+--- a/scripts/uvc-gadget.sh
++++ b/scripts/uvc-gadget.sh
+@@ -62,6 +62,10 @@ create_uvc() {
+ 
+ 	echo "Renaming function"
+ 	echo -n $PRODUCT > functions/$FUNCTION/function_name
++	# Advertise only controls backed by the userspace UVC handler.
++	# Camera Terminal D9 = Zoom Absolute; Processing Unit D0 = Brightness.
++	printf '0x00\n0x02\n0x00\n' > functions/$FUNCTION/control/terminal/camera/default/bmControls
++	echo 0x01 > functions/$FUNCTION/control/processing/default/bmControls
+ 
+ 	# Advertise exactly the resolutions from the persistent config (space-
+ 	# separated WxH in ISIGHT_RESOLUTIONS, populated by isight-config-apply).
+@@ -108,12 +112,11 @@ create_uvc() {
+ 		# Set this XU as the source for the default output terminal
+ 		cat bUnitID > ../../terminal/output/default/bSourceID
+ 
+-		# Flag some arbitrary controls. This sets alternating bits of the
+-		# first byte of bmControls active.
+-		echo 0x55 > bmControls
++		# Selector 1: PiSight persistent settings (8-byte protocol v1).
++		echo 0x01 > bmControls
+ 
+-		# Set the GUID
+-		printf '\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10' > guidExtensionCode
++		# Stable 16-byte GUID, also used by the host configurator.
++		printf 'PiSightSettings1' > guidExtensionCode
+ 
+ 		cd $OLDPWD
+ 	fi

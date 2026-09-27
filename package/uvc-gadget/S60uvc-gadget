@@ -11,9 +11,9 @@ UVC_GADGET_ARGS=""
 start() {
 	printf 'Starting %s: ' "$DAEMON"
 
-	# Apply persisted config (config.json on the FAT boot partition) into the
-	# environment: the gadget setup reads ISIGHT_RESOLUTIONS, the daemon reads
-	# ISIGHT_FOV. Best-effort; missing/invalid config falls back to defaults and
+	# Apply persisted config (isight.json on the FAT boot partition) into the
+	# environment: the gadget setup reads resolution/mic settings; the daemon
+	# reads FOV, EV and logo defaults. Missing config falls back to defaults and
 	# never blocks the camera.
 	isight-config-apply 2>/dev/null
 	[ -f /run/isight.env ] && { set -a; . /run/isight.env; set +a; }
@@ -22,10 +22,16 @@ start() {
 		echo "FAIL"
 		return 1
 	fi
+	# ConfigFS assigns extension unit IDs; pass the actual value to userspace.
+	xu_id=/sys/kernel/config/usb_gadget/g1/functions/uvc.0/control/extensions/xu.0/bUnitID
+	if [ -r "$xu_id" ]; then
+		ISIGHT_XU_UNIT=$(cat "$xu_id")
+		export ISIGHT_XU_UNIT
+	fi
 
 	# Run the daemon backgrounded, but capture its stdout/stderr to a log
-	# readable from the USB ACM shell for UVC Probe/Commit/STREAMON
-	# diagnostics. Functional behaviour is unchanged; only the output
+	# readable on the Pi for UVC Probe/Commit/STREAMON diagnostics.
+	# Functional behaviour is unchanged; only the output
 	# destination differs from the previous start-stop-daemon --background,
 	# which discarded the daemon's output to /dev/null. The daemon runs in
 	# the foreground (no self-daemonize), so $! is its real PID.

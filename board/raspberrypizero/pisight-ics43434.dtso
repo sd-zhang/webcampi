@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// PiSight ICS43434 I2S microphone; LR tied low selects the left slot.
+// The ICS43434 is registerless and uses the compatible ICS43432 codec driver.
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target = <&i2s>;
+		__overlay__ {
+			#sound-dai-cells = <0>;
+			status = "okay";
+		};
+	};
+
+	fragment@1 {
+		target-path = "/";
+		__overlay__ {
+			pisight_mic_codec: pisight-mic-codec {
+				compatible = "invensense,ics43432";
+				#sound-dai-cells = <0>;
+				status = "okay";
+			};
+		};
+	};
+
+	fragment@2 {
+		target = <&sound>;
+		__overlay__ {
+			compatible = "simple-audio-card";
+			simple-audio-card,name = "PiSightMic";
+			simple-audio-card,format = "i2s";
+			simple-audio-card,bitclock-master = <&pisight_mic_cpu>;
+			simple-audio-card,frame-master = <&pisight_mic_cpu>;
+			status = "okay";
+
+			pisight_mic_cpu: simple-audio-card,cpu {
+				sound-dai = <&i2s>;
+				dai-tdm-slot-num = <2>;
+				dai-tdm-slot-width = <32>;
+			};
+
+			simple-audio-card,codec {
+				sound-dai = <&pisight_mic_codec>;
+			};
+		};
+	};
+};
