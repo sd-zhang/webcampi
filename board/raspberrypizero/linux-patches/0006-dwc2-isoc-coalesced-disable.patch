@@ -1,0 +1,34 @@
+From: PiSight developers <pisight@localhost>
+Subject: [PATCH] usb: dwc2: let disabled recovery own coalesced isoc IN completion
+
+In buffer-DMA isochronous IN mode, XFERCOMPL and EPDISBLD may be
+reported together. Completing the request first advances target_frame
+and can start the next request. Disabled recovery then flushes its FIFO
+and unconditionally retires that next request, even if its target frame
+has not elapsed. A Pi Zero trace captured current frame 2361, target
+2362 and interrupt bits 0x3 at that erroneous retirement.
+
+Extend the existing NAK completion exclusion to EPDISBLD. Disabled
+recovery retires the original request once and leaves the next request
+for resynchronization. This conservatively reports ENODATA for the
+original transfer even if some or all of it reached the host. Descriptor
+DMA and non-isochronous completion paths are unchanged.
+
+--- a/drivers/usb/dwc2/gadget.c
++++ b/drivers/usb/dwc2/gadget.c
+@@ -3128,7 +3128,14 @@
+ 			 * need to look at completing IN requests here
+ 			 * if operating slave mode
+ 			 */
+-			if (!hs_ep->isochronous || !(ints & DXEPINT_NAKINTRPT))
++			/*
++			 * Recovery owns the current isochronous request when NAK
++			 * or endpoint-disabled accompanies completion. Completing
++			 * it here can start the next request before recovery flushes
++			 * the FIFO and retires the queue head.
++			 */
++			if (!hs_ep->isochronous ||
++			    !(ints & (DXEPINT_NAKINTRPT | DXEPINT_EPDISBLD)))
+ 				dwc2_hsotg_complete_in(hsotg, hs_ep);
+ 
+ 			if (idx == 0 && !hs_ep->req)

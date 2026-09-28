@@ -26,4 +26,11 @@ define UVC_GADGET_INSTALL_INIT_SYSV
 		$(TARGET_DIR)/etc/init.d/S60uvc-gadget
 endef
 
+# One source of truth shared with the microphone plugin; no extra runtime library.
+define UVC_GADGET_COPY_AUDIO_CONTROLS
+	cp $(BR2_EXTERNAL_WEBCAMPI_PATH)/package/pisight-mic/audio-control.h $(@D)/lib/
+	cp $(BR2_EXTERNAL_WEBCAMPI_PATH)/package/pisight-mic/pisight-controls.h $(@D)/lib/
+endef
+UVC_GADGET_PRE_CONFIGURE_HOOKS += UVC_GADGET_COPY_AUDIO_CONTROLS
+
 $(eval $(meson-package))

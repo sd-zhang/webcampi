@@ -1,0 +1,288 @@
+From: PiSight developers <pisight@localhost>
+Subject: [PATCH] usb: dwc2: guard current-frame recovery from old incomplete events
+
+A delayed global incomplete-IN event can select a current-frame request
+before that frame's EOPF. Acknowledge first, bound the acknowledgment and
+decision times, and leave that request enabled when the event is provably
+old. Preserve later EOPF events and track request identity for recovery
+across frame-counter wrap. Diagnostic arm/timing state from patch0007 is
+required by this correction. Hardware performance remains unverified.
+
+---
+
+--- a/drivers/usb/dwc2/core.h
++++ b/drivers/usb/dwc2/core.h
+@@ -163,6 +163,12 @@
+ 	struct dwc2_isoc_diag isoc_diag[4];
+ 	u32 diag_irq, diag_sessions;
+ 	struct dwc2_diag_arm diag_arm;
++	/* Identity of an IN request spared an old incomplete interrupt. */
++	struct {
++		u64 ns;
++		u32 serial, session, target, epoch;
++		bool valid;
++	} deferred;
+ 
+ 	dma_addr_t		desc_list_dma;
+ 	struct dwc2_dma_desc	*desc_list;
+--- a/drivers/usb/dwc2/gadget.c
++++ b/drivers/usb/dwc2/gadget.c
+@@ -1060,7 +1060,21 @@
+ 	}
+ }
+ 
+-/* Diagnostic only: no policy changes, allocation, or printing in IRQ. */
++/* This state is shared by the timing observer and guarded recovery. */
++static bool dwc2_isoc_epoch_valid(struct dwc2_hsotg *hsotg, u32 dsts, u32 status)
++{
++	return hsotg->gadget.speed == USB_SPEED_HIGH &&
++		hsotg->lx_state == DWC2_L0 && !hsotg->bus_suspended &&
++		using_dma(hsotg) && !using_desc_dma(hsotg) &&
++		!(dsts & (DSTS_SUSPSTS | DSTS_ERRATICERR)) &&
++		!(status & (GINTSTS_USBRST | GINTSTS_RESETDET |
++			    GINTSTS_ENUMDONE | GINTSTS_USBSUSP |
++			    GINTSTS_WKUPINT | GINTSTS_DISCONNINT |
++			    GINTSTS_MODEMIS | GINTSTS_CONIDSTSCHNG));
++}
++
++/* No allocation or printing in IRQ. The timing observations also bound
++ * guarded recovery; they must be retained while that policy is enabled. */
+ static void dwc2_diag_irq_snapshot(struct dwc2_hsotg *hsotg, u32 status, u32 mask)
+ {
+ 	struct dwc2_irq_diag *d = &hsotg->irq_diag;
+@@ -1068,14 +1082,10 @@
+ 	u32 dsts = dwc2_readl(hsotg, DSTS);
+ 	u32 frame = (dsts & DSTS_SOFFN_MASK) >> DSTS_SOFFN_SHIFT;
+ 	u64 after = ktime_get_ns();
+-	bool valid = hsotg->gadget.speed == USB_SPEED_HIGH &&
+-		     hsotg->lx_state == DWC2_L0 && !hsotg->bus_suspended &&
+-		     !(dsts & (DSTS_SUSPSTS | DSTS_ERRATICERR)) &&
+-		     using_dma(hsotg) && !using_desc_dma(hsotg) &&
+-		     !(status & (GINTSTS_USBRST | GINTSTS_RESETDET |
+-				 GINTSTS_ENUMDONE | GINTSTS_USBSUSP |
+-				 GINTSTS_WKUPINT | GINTSTS_DISCONNINT));
+-
++	bool valid = dwc2_isoc_epoch_valid(hsotg, dsts, status);
++
++	if (!valid || !d->last_valid)
++		d->recovery_epoch++;
+ 	d->passes++;
+ 	if (status & mask & GINTSTS_IEPINT)
+ 		d->in_passes++;
+@@ -1102,7 +1112,7 @@
+ 	}
+ }
+ 
+-static void dwc2_diag_disable_decision(struct dwc2_hsotg *hsotg,
++static bool dwc2_diag_disable_decision(struct dwc2_hsotg *hsotg,
+ 				      struct dwc2_hsotg_ep *ep, u32 ctrl)
+ {
+ 	struct dwc2_irq_diag *d = &hsotg->irq_diag;
+@@ -1128,12 +1138,13 @@
+ 	s.ep = ep->index;
+ 	s.session = ep->diag_sessions;
+ 	s.arm = ep->diag_arm;
+-	valid = d->current_valid && hsotg->gadget.speed == USB_SPEED_HIGH &&
+-		hsotg->lx_state == DWC2_L0 && !hsotg->bus_suspended &&
+-		!(dsts & (DSTS_SUSPSTS | DSTS_ERRATICERR)) &&
+-		!(s.status & (GINTSTS_USBRST | GINTSTS_RESETDET |
+-			      GINTSTS_ENUMDONE | GINTSTS_USBSUSP |
+-			      GINTSTS_WKUPINT | GINTSTS_DISCONNINT));
++	valid = dwc2_isoc_epoch_valid(hsotg, dsts, s.status);
++	if (!valid) {
++		d->recovery_epoch++;
++		d->current_valid = false;
++		d->last_valid = false;
++	}
++	valid = valid && d->current_valid;
+ 	if (s.target == s.live) {
+ 		d->selected_current++;
+ 		if (valid && s.live == d->entry_frame &&
+@@ -1150,6 +1161,66 @@
+ 	}
+ 	if (d->sample_count < ARRAY_SIZE(d->samples))
+ 		d->samples[d->sample_count++] = s;
++	return s.before_eopf && s.target == s.live;
++}
++
++/* The arm serial and session distinguish reused request storage. */
++static bool dwc2_isoc_deferred_matches(struct dwc2_hsotg *hsotg,
++				      struct dwc2_hsotg_ep *ep)
++{
++	return ep->deferred.valid && ep->req &&
++		ep->deferred.serial == ep->diag_arm.serial &&
++		ep->deferred.session == ep->diag_sessions &&
++		ep->deferred.target == ep->diag_arm.target &&
++		ep->deferred.epoch == hsotg->irq_diag.recovery_epoch;
++}
++
++static bool dwc2_isoc_deferred_elapsed(struct dwc2_hsotg *hsotg,
++				      struct dwc2_hsotg_ep *ep,
++				      u32 frame, u64 ns)
++{
++	u32 delta;
++
++	if (!dwc2_isoc_deferred_matches(hsotg, ep) ||
++	    !hsotg->irq_diag.current_valid ||
++	    ep->target_frame != ep->deferred.target) {
++		ep->deferred.valid = false;
++		return false;
++	}
++	delta = (frame - ep->deferred.target) & 0x3fff;
++	/* Unlike frame_overrun, this also covers a target at 16383 serviced
++	 * after SOF 0. A long delay of the identical request is unambiguous
++	 * even after a full counter wrap: 250 us exceeds a HS microframe.
++	 * Epoch validation excludes reset/suspend/re-enumeration. */
++	return (delta && delta < 0x2000) ||
++		(ns >= ep->deferred.ns && ns - ep->deferred.ns > 250000);
++}
++
++static bool dwc2_isoc_ack_before_eopf(struct dwc2_hsotg *hsotg,
++				     u32 *frame, u64 *ns)
++{
++	struct dwc2_irq_diag *d = &hsotg->irq_diag;
++	u32 status, dsts;
++	bool valid;
++
++	/* Clear the sampled cause before measuring its age. Readback orders
++	 * the W1C before the frame/time observations. Never clear at exit:
++	 * a genuine new EOPF may arrive while scanning endpoints. */
++	dwc2_writel(hsotg, GINTSTS_INCOMPL_SOIN, GINTSTS);
++	status = dwc2_readl(hsotg, GINTSTS);
++	dsts = dwc2_readl(hsotg, DSTS);
++	*frame = (dsts & DSTS_SOFFN_MASK) >> DSTS_SOFFN_SHIFT;
++	*ns = ktime_get_ns();
++	valid = dwc2_isoc_epoch_valid(hsotg, dsts, status);
++	if (!valid) {
++		d->recovery_epoch++;
++		d->current_valid = false;
++		d->last_valid = false;
++	}
++	return valid && !(status & GINTSTS_INCOMPL_SOIN) &&
++		*frame == d->entry_frame &&
++		dwc2_diag_before_eopf(d->current_valid, d->previous_frame,
++				     d->previous_ns, *frame, *ns, d->dcfg);
+ }
+ 
+ static bool dwc2_gadget_target_frame_elapsed(struct dwc2_hsotg_ep *hs_ep);
+@@ -1267,6 +1338,7 @@
+ 		__func__, packets, length, ureq->length, epsize, epsize_reg);
+ 
+ 	/* store the request as the current one we're doing */
++	hs_ep->deferred.valid = false;
+ 	hs_ep->req = hs_req;
+ 
+ 	if (using_desc_dma(hsotg)) {
+@@ -2273,6 +2345,10 @@
+ 
+ 	dwc2_hsotg_handle_unaligned_buf_complete(hsotg, hs_ep, hs_req);
+ 
++	if (hs_ep->req == hs_req && !hs_req->req.status &&
++	    dwc2_isoc_deferred_matches(hsotg, hs_ep))
++		hsotg->irq_diag.deferred_completed++;
++	hs_ep->deferred.valid = false;
+ 	hs_ep->req = NULL;
+ 	list_del_init(&hs_req->queue);
+ 
+@@ -3777,35 +3853,50 @@
+ static void dwc2_gadget_handle_incomplete_isoc_in(struct dwc2_hsotg *hsotg)
+ {
+ 	struct dwc2_hsotg_ep *hs_ep;
+-	u32 epctrl;
+-	u32 daintmsk;
+-	u32 idx;
+-
+-	dev_dbg(hsotg->dev, "Incomplete isoc in interrupt received:\n");
+-
++	u32 epctrl, daintmsk, idx, frame;
++	u64 ns;
++	bool early_ack, deferred_elapsed, early_decision;
++
++	early_ack = dwc2_isoc_ack_before_eopf(hsotg, &frame, &ns);
+ 	daintmsk = dwc2_readl(hsotg, DAINTMSK);
+ 
+ 	for (idx = 1; idx < hsotg->num_of_eps; idx++) {
+ 		hs_ep = hsotg->eps_in[idx];
+-		/* Proceed only unmasked ISOC EPs */
+ 		if ((BIT(idx) & ~daintmsk) || !hs_ep->isochronous)
+ 			continue;
+-
+ 		epctrl = dwc2_readl(hsotg, DIEPCTL(idx));
+-		if ((epctrl & DXEPCTL_EPENA) &&
++		if (!(epctrl & DXEPCTL_EPENA))
++			continue;
++
++		deferred_elapsed = dwc2_isoc_deferred_elapsed(hsotg, hs_ep,
++							     frame, ns);
++		if (!dwc2_gadget_target_frame_elapsed(hs_ep) && !deferred_elapsed) {
++			hsotg->irq_diag.waiting[idx]++;
++			continue;
++		}
++		early_decision = dwc2_diag_disable_decision(hsotg, hs_ep, epctrl);
++		/* The decision read may have observed a reset/fault after the
++		 * ACK proof. Never use deferred ownership from that old epoch. */
++		if (deferred_elapsed && !dwc2_isoc_deferred_matches(hsotg, hs_ep) &&
+ 		    !dwc2_gadget_target_frame_elapsed(hs_ep))
+-			hsotg->irq_diag.waiting[idx]++;
+-		if ((epctrl & DXEPCTL_EPENA) &&
+-		    dwc2_gadget_target_frame_elapsed(hs_ep)) {
+-			dwc2_diag_disable_decision(hsotg, hs_ep, epctrl);
+-			epctrl |= DXEPCTL_SNAK;
+-			epctrl |= DXEPCTL_EPDIS;
+-			dwc2_writel(hsotg, epctrl, DIEPCTL(idx));
+-		}
+-	}
+-
+-	/* Clear interrupt */
+-	dwc2_writel(hsotg, GINTSTS_INCOMPL_SOIN, GINTSTS);
++			continue;
++		if (early_ack && early_decision && !deferred_elapsed &&
++		    hs_ep->req && hs_ep->target_frame == frame) {
++			hs_ep->deferred.valid = true;
++			hs_ep->deferred.serial = hs_ep->diag_arm.serial;
++			hs_ep->deferred.session = hs_ep->diag_sessions;
++			hs_ep->deferred.target = hs_ep->target_frame;
++			hs_ep->deferred.epoch = hsotg->irq_diag.recovery_epoch;
++			hs_ep->deferred.ns = ns;
++			hsotg->irq_diag.deferred++;
++			continue;
++		}
++		if (dwc2_isoc_deferred_matches(hsotg, hs_ep))
++			hsotg->irq_diag.deferred_recovered++;
++		hs_ep->deferred.valid = false;
++		epctrl |= DXEPCTL_SNAK | DXEPCTL_EPDIS;
++		dwc2_writel(hsotg, epctrl, DIEPCTL(idx));
++	}
+ }
+ 
+ /**
+@@ -4282,6 +4373,7 @@
+ 	hs_ep->halted = 0;
+ 	hs_ep->wedged = 0;
+ 	hs_ep->interval = desc->bInterval;
++	hs_ep->deferred.valid = false;
+ 
+ 	switch (ep_type) {
+ 	case USB_ENDPOINT_XFER_ISOC:
+--- a/drivers/usb/dwc2/debugfs.c
++++ b/drivers/usb/dwc2/debugfs.c
+@@ -324,6 +324,9 @@
+ 		   (unsigned long long)d->handler_ns, d->handler_max_ns);
+ 	seq_printf(seq, "irq_coverage adjacent=%u selected_current=%u selected_current_adjacent=%u\n",
+ 		   d->adjacent, d->selected_current, d->selected_current_adjacent);
++	seq_printf(seq, "irq_recovery deferred=%u completed=%u recovered=%u epoch=%u\n",
++		   d->deferred, d->deferred_completed, d->deferred_recovered,
++		   d->recovery_epoch);
+ 	for (i = 1; i < ARRAY_SIZE(d->waiting); i++) {
+ 		if (d->waiting[i] || d->decisions[i] || d->nak[i] || d->complete[i])
+ 			seq_printf(seq, "irq_endpoint ep=%u waiting=%u selected=%u nak=%u complete=%u\n",
+--- a/drivers/usb/dwc2/isoc-diag.h
++++ b/drivers/usb/dwc2/isoc-diag.h
+@@ -27,6 +27,7 @@
+ };
+ 
+ struct dwc2_irq_diag {
++	u32 recovery_epoch, deferred, deferred_completed, deferred_recovered;
+ 	u64 last_ns, previous_ns, probe_ns, handler_ns;
+ 	u32 entries, handler_max_ns, in_passes, out_passes, incomplete_only;
+ 	u32 last_frame, previous_frame, entry_frame, dcfg;

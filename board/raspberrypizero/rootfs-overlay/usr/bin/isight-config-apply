@@ -40,6 +40,22 @@ case "$quality" in ''|*[!0-9]*) quality=72 ;; esac
 microphone=$(jq -r 'if .microphone == false then "off" else "on" end' "$src" 2>/dev/null)
 [ "$microphone" = off ] || microphone=on
 
+# Accept only a complete, typed audio preset; old/malformed configs retain
+# the fixed-filter defaults. Never interpolate unvalidated JSON into shell.
+audio=$(jq -r '
+ .audio | select(type == "object") |
+ select((.gain_db|type)=="number" and .gain_db>=-24 and .gain_db<=24 and (.gain_db*2|floor)==(.gain_db*2)) |
+ select((.highpass_hz|type)=="number" and (.highpass_hz|floor)==.highpass_hz and (.highpass_hz==0 or (.highpass_hz>=20 and .highpass_hz<=500))) |
+ select((.lowpass_hz|type)=="number" and (.lowpass_hz|floor)==.lowpass_hz and (.lowpass_hz==0 or (.lowpass_hz>=1000 and .lowpass_hz<=20000 and .lowpass_hz%100==0))) |
+ select((.bypass|type)=="boolean") |
+ [(.gain_db*10), .highpass_hz, .lowpass_hz, (if .bypass then 1 else 0 end)] | map(tostring) | join(" ")
+' "$src" 2>/dev/null)
+[ -n "$audio" ] || audio="0 80 8000 0"
+diagnostics=$(jq -r 'if .diagnostics == true then "1" else "0" end' "$src" 2>/dev/null)
+[ "$diagnostics" = 1 ] || diagnostics=0
+printf '%s\n' "$diagnostics" > /run/pisight-diagnostics.tmp
+mv /run/pisight-diagnostics.tmp /run/pisight-diagnostics
+
 cat > "$OUT" <<EOT
 ISIGHT_RESOLUTIONS="$res"
 ISIGHT_FOV=$fov
@@ -47,4 +63,6 @@ ISIGHT_EV=$ev
 ISIGHT_LOGO=$logo
 ISIGHT_QUALITY=$quality
 ISIGHT_MICROPHONE=$microphone
+ISIGHT_AUDIO="$audio"
+ISIGHT_DIAGNOSTICS=$diagnostics
 EOT

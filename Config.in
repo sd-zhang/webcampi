@@ -1,1 +1,2 @@
 source "$BR2_EXTERNAL_WEBCAMPI_PATH/package/uvc-gadget/Config.in"
+source "$BR2_EXTERNAL_WEBCAMPI_PATH/package/pisight-mic/Config.in"

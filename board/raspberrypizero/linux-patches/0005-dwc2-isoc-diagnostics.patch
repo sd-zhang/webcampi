@@ -1,0 +1,227 @@
+usb: dwc2: record bounded missed-isochronous recovery evidence
+
+Diagnostics only: retain per-path drop counts and first/last/worst burst
+start context across endpoint reopens. Expose through read-only debugfs; no IRQ
+printk, no change to endpoint cadence or recovery decisions. last_irq is the
+last endpoint interrupt flags, which can precede a process-context queue.
+
+--- a/drivers/usb/dwc2/core.h
++++ b/drivers/usb/dwc2/core.h
+@@ -119,6 +119,18 @@
+  * as in shared-fifo mode periodic in acts like a single-frame packet
+  * buffer than a fifo)
+  */
++/* Bounded evidence for missed isochronous requests. Updated under hsotg->lock. */
++struct dwc2_isoc_diag_sample {
++	u64 ns;
++	u32 cached, live, target, overrun, irq, session;
++};
++
++struct dwc2_isoc_diag {
++	u32 missed, payload, max_burst;
++	bool worst_updated;
++	struct dwc2_isoc_diag_sample first, last, worst;
++};
++
+ struct dwc2_hsotg_ep {
+ 	struct usb_ep           ep;
+ 	struct list_head        queue;
+@@ -147,6 +159,8 @@
+ 	unsigned int            target_frame;
+ #define TARGET_FRAME_INITIAL   0xFFFFFFFF
+ 	bool			frame_overrun;
++	struct dwc2_isoc_diag isoc_diag[4];
++	u32 diag_irq, diag_sessions;
+ 
+ 	dma_addr_t		desc_list_dma;
+ 	struct dwc2_dma_desc	*desc_list;
+--- a/drivers/usb/dwc2/gadget.c
++++ b/drivers/usb/dwc2/gadget.c
+@@ -1029,6 +1029,37 @@
+ 	dwc2_writel(hsotg, ctrl, depctl);
+ }
+ 
++/* reason: 0=start, 1=disabled, 2=out-token, 3=NAK. No printk in IRQ
++ * recovery. Sample clocks only at the first drop in each recovery pass. */
++static void dwc2_isoc_diag_miss(struct dwc2_hsotg_ep *ep, unsigned int reason,
++			       u32 burst, struct dwc2_hsotg_req *req)
++{
++	struct dwc2_isoc_diag *d = &ep->isoc_diag[reason];
++
++	if (burst == 1) {
++		d->worst_updated = false;
++		d->last.ns = ktime_get_ns();
++		d->last.cached = ep->parent->frame_number;
++		d->last.live = dwc2_hsotg_read_frameno(ep->parent);
++		d->last.target = ep->target_frame;
++		d->last.overrun = ep->frame_overrun;
++		d->last.irq = ep->diag_irq;
++		d->last.session = ep->diag_sessions;
++		if (!d->missed)
++			d->first = d->last;
++	}
++	d->missed++;
++	if (req->req.length)
++		d->payload++;
++	if (burst > d->max_burst) {
++		d->max_burst = burst;
++		if (!d->worst_updated) {
++			d->worst = d->last;
++			d->worst_updated = true;
++		}
++	}
++}
++
+ static bool dwc2_gadget_target_frame_elapsed(struct dwc2_hsotg_ep *hs_ep);
+ static void dwc2_hsotg_complete_request(struct dwc2_hsotg *hsotg,
+ 					struct dwc2_hsotg_ep *hs_ep,
+@@ -1199,6 +1230,7 @@
+ 		} else {
+ 			hs_req->req.frame_number = hs_ep->target_frame;
+ 			hs_req->req.actual = 0;
++			dwc2_isoc_diag_miss(hs_ep, 0, 1, hs_req);
+ 			dwc2_hsotg_complete_request(hsotg, hs_ep, hs_req, -ENODATA);
+ 			return;
+ 		}
+@@ -2825,6 +2857,7 @@
+ {
+ 	struct dwc2_hsotg *hsotg = hs_ep->parent;
+ 	struct dwc2_hsotg_req *hs_req;
++	u32 diag_burst = 0;
+ 	unsigned char idx = hs_ep->index;
+ 	int dir_in = hs_ep->dir_in;
+ 	u32 epctl_reg = dir_in ? DIEPCTL(idx) : DOEPCTL(idx);
+@@ -2865,6 +2898,7 @@
+ 		if (hs_req) {
+ 			hs_req->req.frame_number = hs_ep->target_frame;
+ 			hs_req->req.actual = 0;
++			dwc2_isoc_diag_miss(hs_ep, 1, ++diag_burst, hs_req);
+ 			dwc2_hsotg_complete_request(hsotg, hs_ep, hs_req,
+ 						    -ENODATA);
+ 		}
+@@ -2889,6 +2923,7 @@
+ {
+ 	struct dwc2_hsotg *hsotg = ep->parent;
+ 	struct dwc2_hsotg_req *hs_req;
++	u32 diag_burst = 0;
+ 	int dir_in = ep->dir_in;
+ 
+ 	if (dir_in || !ep->isochronous)
+@@ -2923,6 +2958,7 @@
+ 		if (hs_req) {
+ 			hs_req->req.frame_number = ep->target_frame;
+ 			hs_req->req.actual = 0;
++			dwc2_isoc_diag_miss(ep, 2, ++diag_burst, hs_req);
+ 			dwc2_hsotg_complete_request(hsotg, ep, hs_req, -ENODATA);
+ 		}
+ 
+@@ -2957,6 +2993,7 @@
+ {
+ 	struct dwc2_hsotg *hsotg = hs_ep->parent;
+ 	struct dwc2_hsotg_req *hs_req;
++	u32 diag_burst = 0;
+ 	int dir_in = hs_ep->dir_in;
+ 	u32 ctrl;
+ 
+@@ -3016,6 +3053,7 @@
+ 		if (hs_req) {
+ 			hs_req->req.frame_number = hs_ep->target_frame;
+ 			hs_req->req.actual = 0;
++			dwc2_isoc_diag_miss(hs_ep, 3, ++diag_burst, hs_req);
+ 			dwc2_hsotg_complete_request(hsotg, hs_ep, hs_req, -ENODATA);
+ 		}
+ 
+@@ -3058,6 +3096,8 @@
+ 
+ 	dev_dbg(hsotg->dev, "%s: ep%d(%s) DxEPINT=0x%08x\n",
+ 		__func__, idx, dir_in ? "in" : "out", ints);
++
++	hs_ep->diag_irq = ints;
+ 
+ 	/* Don't process XferCompl interrupt if it is a setup packet */
+ 	if (idx == 0 && (ints & (DXEPINT_SETUP | DXEPINT_SETUP_RCVD)))
+@@ -4121,6 +4161,8 @@
+ 		hs_ep->isochronous = 1;
+ 		hs_ep->interval = 1 << (desc->bInterval - 1);
+ 		hs_ep->target_frame = TARGET_FRAME_INITIAL;
++		hs_ep->diag_sessions++;
++		hs_ep->diag_irq = 0;
+ 		hs_ep->next_desc = 0;
+ 		hs_ep->compl_desc = 0;
+ 		if (dir_in) {
+--- a/drivers/usb/dwc2/debugfs.c
++++ b/drivers/usb/dwc2/debugfs.c
+@@ -289,12 +289,73 @@
+  * with the same name as the device itself, in case we end up
+  * with multiple blocks in future systems.
+  */
++/* Read-only lifetime counters. Retain them across stream reopens so a
++ * periodic logger cannot miss a short session. Never format in IRQ context. */
++static int isoc_stats_show(struct seq_file *seq, void *v)
++{
++	struct dwc2_hsotg *hsotg = seq->private;
++	static const char * const names[] = { "start", "disabled", "out-token", "nak" };
++	static const char * const labels[] = { "first_burst", "last_burst", "worst_burst" };
++	unsigned int index, direction, i, j;
++	unsigned long flags;
++
++	for (direction = 0; direction < 2; ++direction) {
++		for (index = 1; index < hsotg->num_of_eps; ++index) {
++			struct dwc2_hsotg_ep *ep = direction ?
++				hsotg->eps_in[index] : hsotg->eps_out[index];
++			struct dwc2_isoc_diag saved[4];
++			u32 sessions;
++			u16 interval;
++			bool dma, ddma;
++
++			if (!ep)
++				continue;
++			spin_lock_irqsave(&hsotg->lock, flags);
++			sessions = ep->diag_sessions;
++			interval = ep->interval;
++			dma = hsotg->params.g_dma;
++			ddma = hsotg->params.g_dma_desc;
++			memcpy(saved, ep->isoc_diag, sizeof(saved));
++			spin_unlock_irqrestore(&hsotg->lock, flags);
++			if (!sessions)
++				continue;
++			seq_printf(seq, "%s sessions=%u interval=%u dma=%u ddma=%u\n",
++				   ep->ep.name, sessions, interval, dma, ddma);
++			for (i = 0; i < 4; ++i) {
++				struct dwc2_isoc_diag *d = &saved[i];
++				const struct dwc2_isoc_diag_sample *samples[] = {
++					&d->first, &d->last, &d->worst
++				};
++
++				seq_printf(seq, "%s %s missed=%u payload=%u max_burst=%u\n",
++					   ep->ep.name, names[i], d->missed, d->payload,
++					   d->max_burst);
++				if (!d->missed)
++					continue;
++				for (j = 0; j < 3; ++j) {
++					const struct dwc2_isoc_diag_sample *sample = samples[j];
++
++					seq_printf(seq, "%s %s %s ns=%llu session=%u cached=%u live=%u target=%u overrun=%u last_irq=%#x\n",
++						   ep->ep.name, names[i], labels[j],
++						   (unsigned long long)sample->ns, sample->session,
++						   sample->cached, sample->live, sample->target,
++						   sample->overrun, sample->irq);
++				}
++			}
++		}
++	}
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(isoc_stats);
++
+ static void dwc2_hsotg_create_debug(struct dwc2_hsotg *hsotg)
+ {
+ 	struct dentry *root;
+ 	unsigned int epidx;
+ 
+ 	root = hsotg->debug_root;
++
++	debugfs_create_file("isoc_stats", 0444, root, hsotg, &isoc_stats_fops);
+ 
+ 	/* create general state file */
+ 	debugfs_create_file("state", 0444, root, hsotg, &state_fops);

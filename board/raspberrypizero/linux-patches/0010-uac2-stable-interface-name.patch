@@ -1,0 +1,29 @@
+From: PiSight development <pisight@local>
+Subject: [PATCH] usb: gadget: uac2: use stable function name for streaming interfaces
+
+Expose the configured audio function name for both alternate settings, so
+host applications do not show an idle/active state as the microphone name.
+Only string contents change; interface IDs and streaming behavior are unchanged.
+
+--- a/drivers/usb/gadget/function/f_uac2.c
++++ b/drivers/usb/gadget/function/f_uac2.c
+@@ -1044,15 +1044,15 @@
+ 	strings_fn[STR_USB_IT_CH].s = uac2_opts->c_it_ch_name;
+ 	strings_fn[STR_IO_OT].s = uac2_opts->c_ot_name;
+ 	strings_fn[STR_FU_OUT].s = uac2_opts->c_fu_vol_name;
+-	strings_fn[STR_AS_OUT_ALT0].s = "Playback Inactive";
+-	strings_fn[STR_AS_OUT_ALT1].s = "Playback Active";
++	strings_fn[STR_AS_OUT_ALT0].s = uac2_opts->function_name;
++	strings_fn[STR_AS_OUT_ALT1].s = uac2_opts->function_name;
+ 
+ 	strings_fn[STR_IO_IT].s = uac2_opts->p_it_name;
+ 	strings_fn[STR_IO_IT_CH].s = uac2_opts->p_it_ch_name;
+ 	strings_fn[STR_USB_OT].s = uac2_opts->p_ot_name;
+ 	strings_fn[STR_FU_IN].s = uac2_opts->p_fu_vol_name;
+-	strings_fn[STR_AS_IN_ALT0].s = "Capture Inactive";
+-	strings_fn[STR_AS_IN_ALT1].s = "Capture Active";
++	strings_fn[STR_AS_IN_ALT0].s = uac2_opts->function_name;
++	strings_fn[STR_AS_IN_ALT1].s = uac2_opts->function_name;
+ 
+ 	us = usb_gstrings_attach(cdev, fn_strings, ARRAY_SIZE(strings_fn));
+ 	if (IS_ERR(us))

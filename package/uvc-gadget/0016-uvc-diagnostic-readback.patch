@@ -1,0 +1,286 @@
+From: PiSight developers <pisight@localhost>
+Subject: [PATCH] uvc: read bounded diagnostic snapshots through the existing XU
+
+Add selector 2 to the existing PiSightSettings1 extension unit for readback
+of the saved diagnostic log or current DWC2 counters. Use 60-byte controls,
+the actual UVC event payload limit, with generation-tagged immutable pages.
+Allow only two fixed read-only source paths. Bound snapshot allocation and
+reject malformed commands. Suppress per-transfer diagnostic logging for
+this selector so reading a log does not flood the log itself.
+
+This adds no USB interface or streaming endpoint and changes no video/audio
+transport settings. Snapshot retrieval is host-triggered and should normally
+run after capture to avoid adding measurement load. It is not a performance
+fix; it lets future diagnostics be collected without removing the SD card.
+
+--- a/lib/uvc.c
++++ b/lib/uvc.c
+@@ -25,6 +25,7 @@
+ #include "stream.h"
+ #include "tools.h"
+ #include "uvc-debug.h"
++#include "pisight-diagnostic.h"
+ #include "uvc.h"
+ #include "v4l2.h"
+ #include "video-source.h"
+@@ -42,6 +43,9 @@
+ #define UVC_STRING_STREAMING_IDX	1
+ #endif
+ 
++_Static_assert(sizeof(((struct uvc_request_data *)0)->data) >= 60,
++	       "diagnostic response exceeds UVC event payload");
++
+ struct uvc_device
+ {
+ 	struct v4l2_device *vdev;
+@@ -61,6 +65,7 @@
+ 	uint8_t fov;
+ 	uint8_t logo_mode;
+ 	uint8_t microphone;
++	struct pisight_diagnostic diagnostic;
+ 
+ 	unsigned int fcc;
+ 	unsigned int width;
+@@ -171,6 +176,7 @@
+ 
+ void uvc_close(struct uvc_device *dev)
+ {
++	pisight_diag_close(&dev->diagnostic);
+ 	v4l2_close(dev->vdev);
+ 	dev->vdev = NULL;
+ 
+@@ -257,6 +263,24 @@
+ 	int maximum;
+ 	int resolution;
+ 
++	if (dev->xu_unit && entity == dev->xu_unit && cs == 2) {
++		if (req == UVC_SET_CUR && len == 60) {
++			dev->control_entity = entity;
++			dev->control = cs;
++			resp->length = 60;
++		} else if (req == UVC_GET_LEN && len == 2) {
++			resp->data[0] = 60;
++			resp->data[1] = 0;
++			resp->length = 2;
++		} else if (req == UVC_GET_INFO && len == 1) {
++			resp->data[0] = 3;
++			resp->length = 1;
++		} else if (req == UVC_GET_CUR && len <= 60) {
++			pisight_diag_read(&dev->diagnostic, resp->data);
++			resp->length = len;
++		}
++		return;
++	}
+ 	if (dev->xu_unit && entity == dev->xu_unit && cs == 1) {
+ 		if (req == UVC_SET_CUR && len == 8) {
+ 			dev->control_entity = entity;
+@@ -430,6 +454,15 @@
+ 	}
+ }
+ 
++static int uvc_is_diagnostic(struct uvc_device *dev,
++			     const struct usb_ctrlrequest *ctrl)
++{
++	return dev->xu_unit && ctrl->wIndex >> 8 == dev->xu_unit &&
++		(ctrl->wIndex & 0xff) == UVC_STRING_CONTROL_IDX &&
++		ctrl->wValue == 0x0200 &&
++		(ctrl->bRequestType == 0xa1 || ctrl->bRequestType == 0x21);
++}
++
+ static void
+ uvc_events_process_setup(struct uvc_device *dev,
+ 			 const struct usb_ctrlrequest *ctrl,
+@@ -437,6 +470,18 @@
+ {
+ 	dev->control = 0;
+ 	dev->control_entity = 0;
++
++	if (dev->xu_unit && ctrl->wIndex >> 8 == dev->xu_unit &&
++	    ctrl->wValue >> 8 == 2) {
++		if (!uvc_is_diagnostic(dev, ctrl))
++			return;
++		/* Reject direction/request mismatches before arming a data stage. */
++		if ((ctrl->bRequest == UVC_SET_CUR) != (ctrl->bRequestType == 0x21))
++			return;
++		uvc_events_process_control(dev, ctrl->bRequest, dev->xu_unit,
++					   2, ctrl->wLength, resp);
++		return;
++	}
+ 
+ 	printf("bRequestType %02x bRequest %02x wValue %04x wIndex %04x "
+ 		"wLength %04x\n", ctrl->bRequestType, ctrl->bRequest,
+@@ -491,6 +536,16 @@
+ uvc_events_process_data(struct uvc_device *dev,
+ 			const struct uvc_request_data *data)
+ {
++	if (dev->xu_unit && dev->control_entity == dev->xu_unit && dev->control == 2) {
++		static const char *const paths[2] = {
++			"/tmp/PISIGHT.TXT",
++			"/sys/kernel/debug/usb/20980000.usb/isoc_stats",
++		};
++		pisight_diag_command(&dev->diagnostic, data->data, data->length, paths);
++		dev->control_entity = 0;
++		dev->control = 0;
++		return;
++	}
+ 	if (dev->control_entity) {
+ 		if (dev->control_entity == dev->xu_unit && dev->control == 1 &&
+ 		    data->length == 8) {
+@@ -630,16 +685,19 @@
+ 		uvc_log("EVENT_CONNECT\n");
+ 		return;
+ 	case UVC_EVENT_DISCONNECT:
++		pisight_diag_close(&dev->diagnostic);
+ 		uvc_log("EVENT_DISCONNECT\n");
+ 		return;
+ 
+ 	case UVC_EVENT_SETUP:
+-		uvc_log("EVENT_SETUP\n");
++		if (!uvc_is_diagnostic(dev, &uvc_event->req))
++			uvc_log("EVENT_SETUP\n");
+ 		uvc_events_process_setup(dev, &uvc_event->req, &resp);
+ 		break;
+ 
+ 	case UVC_EVENT_DATA:
+-		uvc_log("EVENT_DATA\n");
++		if (!(dev->xu_unit && dev->control_entity == dev->xu_unit && dev->control == 2))
++			uvc_log("EVENT_DATA\n");
+ 		uvc_events_process_data(dev, &uvc_event->data);
+ 		return;
+ 
+@@ -675,6 +733,8 @@
+ 	uvc_fill_streaming_control(dev, &dev->commit, 1, 1, 0);
+ 
+ 	memset(&sub, 0, sizeof sub);
++	sub.type = UVC_EVENT_DISCONNECT;
++	ioctl(dev->vdev->fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
+ 	sub.type = UVC_EVENT_SETUP;
+ 	ioctl(dev->vdev->fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
+ 	sub.type = UVC_EVENT_DATA;
+--- /dev/null
++++ b/lib/pisight-diagnostic.h
+@@ -0,0 +1,110 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef PISIGHT_DIAGNOSTIC_H
++#define PISIGHT_DIAGNOSTIC_H
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define PISIGHT_DIAG_MAX (4U * 1024U * 1024U)
++
++/* Selector 2: fixed 60-byte commands/responses. Never writes target files. */
++struct pisight_diagnostic {
++	uint8_t *data;
++	uint32_t size, offset, generation;
++	uint8_t status;
++};
++static inline uint32_t pisight_diag_u32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
++		(uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++static inline void pisight_diag_put32(uint8_t *p, uint32_t v)
++{
++	for (unsigned int i = 0; i < 4; ++i)
++		p[i] = v >> (8 * i);
++}
++static inline void pisight_diag_close(struct pisight_diagnostic *d)
++{
++	free(d->data);
++	d->data = NULL;
++	d->size = d->offset = 0;
++	d->status = 1; /* no snapshot */
++}
++static inline void pisight_diag_command(struct pisight_diagnostic *d,
++		const uint8_t *p, int length, const char *const paths[2])
++{
++	uint32_t generation, offset;
++	FILE *f;
++	size_t size;
++
++	d->status = 4; /* invalid request or stale generation */
++	if (length != 60 || p[0] != 1 || p[2] > 1 || p[3])
++		return;
++	for (unsigned int i = 12; i < 60; ++i)
++		if (p[i])
++			return;
++	generation = pisight_diag_u32(p + 4);
++	offset = pisight_diag_u32(p + 8);
++	if (p[1] == 2) { /* select an absolute offset; GET_CUR is idempotent */
++		if (p[2] || !d->data || generation != d->generation)
++			return;
++		if (offset > d->size) {
++			d->status = 3;
++			return;
++		}
++		d->offset = offset;
++		d->status = 0;
++		return;
++	}
++	if (generation || offset || (p[1] != 1 && p[1] != 3))
++		return;
++	if (p[1] == 3 && p[2])
++		return;
++	pisight_diag_close(d);
++	if (p[1] == 3)
++		return;
++	/* Capture a bounded immutable copy, including debugfs files of size 0.
++	 * The host normally requests it after stopping A/V capture. */
++	f = fopen(paths[p[2]], "rb");
++	if (!f) {
++		d->status = 2;
++		return;
++	}
++	d->data = malloc(PISIGHT_DIAG_MAX);
++	if (!d->data) {
++		fclose(f);
++		d->status = 6;
++		return;
++	}
++	size = fread(d->data, 1, PISIGHT_DIAG_MAX, f);
++	int extra = size == PISIGHT_DIAG_MAX ? fgetc(f) : EOF;
++	int failed = ferror(f);
++	fclose(f);
++	if (failed || extra != EOF) {
++		pisight_diag_close(d);
++		d->status = failed ? 2 : 5;
++		return;
++	}
++	d->size = size;
++	if (!++d->generation)
++		++d->generation;
++	d->status = 0;
++}
++static inline void pisight_diag_read(const struct pisight_diagnostic *d,
++				    uint8_t out[60])
++{
++	memset(out, 0, 60);
++	out[0] = 1;
++	out[1] = d->status ? d->status : (d->data ? 0 : 1);
++	pisight_diag_put32(out + 4, d->generation);
++	pisight_diag_put32(out + 8, d->size);
++	pisight_diag_put32(out + 12, d->offset);
++	if (out[1])
++		return;
++	uint32_t remaining = d->size - d->offset;
++	out[2] = remaining < 44 ? remaining : 44;
++	out[3] = remaining <= 44;
++	memcpy(out + 16, d->data + d->offset, out[2]);
++}
++#endif
+--- a/scripts/uvc-gadget.sh
++++ b/scripts/uvc-gadget.sh
+@@ -112,8 +112,9 @@
+ 		# Set this XU as the source for the default output terminal
+ 		cat bUnitID > ../../terminal/output/default/bSourceID
+ 
+-		# Selector 1: PiSight persistent settings (8-byte protocol v1).
+-		echo 0x01 > bmControls
++		# Selectors 1: settings; 2: diagnostic snapshot readback.
++		echo 2 > bNumControls
++		echo 0x03 > bmControls
+ 
+ 		# Stable 16-byte GUID, also used by the host configurator.
+ 		printf 'PiSightSettings1' > guidExtensionCode

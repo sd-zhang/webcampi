@@ -15,7 +15,7 @@ start() {
 	# environment: the gadget setup reads resolution/mic settings; the daemon
 	# reads FOV, EV and logo defaults. Missing config falls back to defaults and
 	# never blocks the camera.
-	isight-config-apply 2>/dev/null
+	sh -x /usr/bin/isight-config-apply > /tmp/isight-config-apply.log 2>&1
 	if [ -f /run/isight.env ]; then
 		. /run/isight.env
 		# BusyBox hush has no `set -a`; export the known settings explicitly.
@@ -23,7 +23,7 @@ start() {
 		export ISIGHT_QUALITY ISIGHT_MICROPHONE ISIGHT_AUDIO ISIGHT_DIAGNOSTICS
 	fi
 
-	if ! sh "$SETUP" start > /dev/null 2>&1; then
+	if ! sh "$SETUP" start > /tmp/uvc-setup.log 2>&1; then
 		echo "FAIL"
 		return 1
 	fi

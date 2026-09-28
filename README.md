@@ -44,7 +44,7 @@ An embedded Linux image that turns a Raspberry Pi Zero (v1.3, BCM2835/ARMv6) and
 - **Fast boot:** Less than 6 seconds to go from plugged in to functional.
 - **Running status:** [GPIO 23](https://pinout.xyz/pinout/pin16_gpio23) goes `HIGH` whenever uvc-gadget is active (also drives the optional logo LED; see `logo_light`).
 - **Streaming status:** [GPIO 24](https://pinout.xyz/pinout/pin18_gpio24) goes `HIGH` whenever video is being streamed to host.
-- **Pause/resume:** [GPIO 26](https://pinout.xyz/pinout/pin37_gpio26) freezes video on `HIGH` while keeping the stream alive.
+- **Shutter soft switch:** With `uvc-gadget -S` (enabled by the PiSight boot service), [GPIO 26](https://pinout.xyz/pinout/pin37_gpio26) `HIGH` disconnects both USB camera and microphone; `LOW` reconnects them. Kernel-debounced GPIO edge events avoid a sampling worker. The Pi stays powered; apps may need to reopen the devices.
 
 ## Installation
 
@@ -154,6 +154,31 @@ configfs UVC/UAC2 gadget can claim it at boot. If a host shows only inactive
 audio devices and no camera, check the boot log for `g_audio` binding the
 controller and the UVC setup failing with `Device or resource busy`;
 changing `isight.json` cannot resolve that kernel configuration conflict.
+
+The Pi Zero overlay starts `pigpiod` with `-t 0 -m` via `/etc/default/pigpio`,
+using the PWM peripheral for its clock and leaving PCM/I2S to the microphone. The default
+pigpio PCM clock conflicts with `bcm2835-i2s`: it sets the transmit-enable bit
+that makes the audio driver skip microphone configuration. The `-m` flag disables continuous GPIO alert sampling. Keep pigpio waveform
+output unused, as it would claim the secondary (PCM) peripheral in this mode.
+
+## PiSight accepted baseline (2026-09-28)
+
+The Pi Zero configuration includes a supervised I2S-to-UAC2 microphone bridge,
+frame-aligned DWC2 audio endpoint scheduling, hardware MJPEG recovery fixes,
+event-driven LEDs/shutter, and suppressed-debug-log CPU cleanup. The tested
+720p camera runs at about 29.96 fps with the microphone active; rare JPEG errors
+remain. Audio filtering brings the microphone process to about 9% CPU.
+
+`isight.json` accepts `audio` (default 0 dB, 80 Hz high-pass, 8 kHz low-pass,
+bypass false) and `diagnostics` (default false). Live audio settings and diagnostic
+control use the existing UVC extension unit, with explicit asynchronous Save.
+Periodic diagnostic snapshots are bounded RAM files downloadable over UVC;
+automatic SD log copies are removed. Bulk downloads may briefly affect video.
+No USB serial or web interface is added.
+
+The parent PiSight repository contains the current hardware report, test sources,
+and `docs/uvc-audio-controls.md` protocol specification. These changes do not
+claim calibrated acoustic latency or verified physical shutter wiring.
 
 ## Credits
 

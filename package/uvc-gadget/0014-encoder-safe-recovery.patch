@@ -1,0 +1,573 @@
+From: PiSight maintainers
+Subject: [PATCH] Bound codec waits, reject damaged frames and recycle failures safely
+
+Close uncertain codec queues before source reuse; deliver encoder completions on
+the event loop and retain requests until workers join. Count failures and timing.
+
+--- a/lib/hw_mjpeg_encoder.hpp
++++ b/lib/hw_mjpeg_encoder.hpp
+@@ -9,6 +9,8 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++#include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+ #include <memory>
+@@ -56,6 +58,8 @@
+ 		      unsigned int width, unsigned int height,
+ 		      uint8_t *dest, size_t dest_size);
+ 
++	void Cancel() { cancelled_.store(true); }
++
+ 	const std::string &DevicePath() const { return dev_path_; }
+ 
+ private:
+@@ -66,6 +70,13 @@
+ 		size_t length = 0;
+ 	};
+ 
++	bool dequeue(struct v4l2_buffer &buf, std::chrono::steady_clock::time_point deadline);
++	void resetCodec();
++	std::atomic<bool> cancelled_{false};
++	uint64_t frames_ = 0, failures_ = 0, corrupt_ = 0, invalid_ = 0;
++	uint64_t timeouts_ = 0, resets_ = 0, total_us_ = 0, max_us_ = 0;
++	uint64_t output_wait_us_ = 0, capture_wait_us_ = 0;
++	void report() const;
+ 	bool startStreaming();
+ 	void stopStreaming();
+ 	void releaseBuffers();
+--- a/lib/hw_mjpeg_encoder.cpp
++++ b/lib/hw_mjpeg_encoder.cpp
+@@ -11,6 +11,8 @@
+  * mmap'd buffer.
+  */
+ 
++#include <algorithm>
++#include <thread>
+ #include <cerrno>
+ #include <cstring>
+ #include <dirent.h>
+@@ -106,7 +108,7 @@
+ 				continue;
+ 
+ 			std::string path = std::string("/dev/") + ent->d_name;
+-			int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
++			int fd = open(path.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK);
+ 			if (fd == -1)
+ 				continue;
+ 
+@@ -122,7 +124,7 @@
+ 
+ 	/* Fall back to the well-known bcm2835-codec encode node. */
+ 	if (chosen_fd == -1) {
+-		int fd = open(HW_FALLBACK_DEVICE, O_RDWR | O_CLOEXEC);
++		int fd = open(HW_FALLBACK_DEVICE, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+ 		if (fd != -1) {
+ 			if (isJpegM2MEncoder(fd)) {
+ 				chosen = HW_FALLBACK_DEVICE;
+@@ -155,15 +157,24 @@
+ 
+ HwMjpegEncoder::~HwMjpegEncoder()
+ {
+-	stopStreaming();
+-	releaseBuffers();
+-	if (fd_ != -1)
+-		close(fd_);
++	report();
++	resetCodec();
+ }
+ 
+ bool HwMjpegEncoder::Configure(unsigned int width, unsigned int height,
+ 			       unsigned int src_stride)
+ {
++	if (cancelled_)
++		return false;
++	if (fd_ == -1) {
++		fd_ = open(dev_path_.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK);
++		if (fd_ == -1)
++			return false;
++		struct v4l2_control ctrl = {};
++		ctrl.id = V4L2_CID_JPEG_COMPRESSION_QUALITY;
++		ctrl.value = quality_;
++		xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
++	}
+ 	if (configured_ && width == width_ && height == height_)
+ 		return true;
+ 
+@@ -222,11 +233,15 @@
+ 		return false;
+ 	}
+ 
+-	if (!setupQueue(true) || !setupQueue(false))
+-		return false;
+-
+-	if (!startStreaming())
+-		return false;
++	if (!setupQueue(true) || !setupQueue(false)) {
++		resetCodec();
++		return false;
++	}
++
++	if (!startStreaming()) {
++		resetCodec();
++		return false;
++	}
+ 
+ 	configured_ = true;
+ 	return true;
+@@ -299,6 +314,8 @@
+ 	enum v4l2_buf_type out_type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+ 	enum v4l2_buf_type cap_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+ 
++	/* Also unwind a partially successful STREAMON. */
++	streaming_ = true;
+ 	if (xioctl(fd_, VIDIOC_STREAMON, &out_type) == -1 ||
+ 	    xioctl(fd_, VIDIOC_STREAMON, &cap_type) == -1) {
+ 		std::cerr << "HwMjpegEncoder: STREAMON failed: "
+@@ -347,14 +364,74 @@
+ 	}
+ }
+ 
++bool HwMjpegEncoder::dequeue(struct v4l2_buffer &buf,
++			      std::chrono::steady_clock::time_point deadline)
++{
++	/* O_NONBLOCK applies to both queues. A short sleep avoids spinning on
++	 * POLLOUT when only the other mem2mem queue has completed. */
++	while (!cancelled_) {
++		if (ioctl(fd_, VIDIOC_DQBUF, &buf) == 0)
++			return true;
++		if (errno != EAGAIN && errno != EINTR)
++			return false;
++		if (std::chrono::steady_clock::now() >= deadline) {
++			++timeouts_;
++			return false;
++		}
++		std::this_thread::sleep_for(std::chrono::milliseconds(2));
++	}
++	return false;
++}
++
++void HwMjpegEncoder::resetCodec()
++{
++	/* Close even if STREAMOFF fails: never reuse a possibly queued index or
++	 * return its imported camera DMA-BUF while the old fd still owns it. */
++	stopStreaming();
++	if (fd_ != -1) {
++		close(fd_);
++		fd_ = -1;
++		++resets_;
++	}
++	releaseBuffers();
++	configured_ = false;
++}
++
++void HwMjpegEncoder::report() const
++{
++	std::cerr << "MJPEG codec: frames=" << frames_ << " failed=" << failures_
++		  << " corrupt=" << corrupt_ << " invalid=" << invalid_
++		  << " timeouts=" << timeouts_ << " resets=" << resets_
++		  << " encode_mean_us=" << (frames_ ? total_us_ / frames_ : 0)
++		  << " encode_max_us=" << max_us_
++		  << " output_wait_mean_us=" << (frames_ ? output_wait_us_ / frames_ : 0)
++		  << " capture_wait_mean_us=" << (frames_ ? capture_wait_us_ / frames_ : 0)
++		  << std::endl;
++}
++
+ size_t HwMjpegEncoder::Encode(int dmabuf_fd, unsigned int src_stride,
+ 			      unsigned int width, unsigned int height,
+ 			      uint8_t *dest, size_t dest_size)
+ {
+-	if (!configured_)
++	if (!configured_ || cancelled_)
+ 		return 0;
+ 
+ 	(void)src_stride;
++	(void)width;
++	(void)height;
++	const auto started = std::chrono::steady_clock::now();
++	const auto deadline = started + std::chrono::milliseconds(1000);
++	++frames_;
++	auto finish = [&](size_t bytes) {
++		auto us = std::chrono::duration_cast<std::chrono::microseconds>(
++			std::chrono::steady_clock::now() - started).count();
++		total_us_ += us;
++		max_us_ = std::max(max_us_, static_cast<uint64_t>(us));
++		if (!bytes) ++failures_;
++		if (frames_ % 300 == 0 || (failures_ == 1 && !bytes)) report();
++		return bytes;
++	};
++	auto failed = [&]() { resetCodec(); return finish(0); };
+ 
+ 	/*
+ 	 * Zero-copy input: import the libcamera frame's DMA-BUF straight into
+@@ -380,9 +457,7 @@
+ 	plane.data_offset = 0;
+ 
+ 	if (xioctl(fd_, VIDIOC_QBUF, &buf) == -1) {
+-		std::cerr << "HwMjpegEncoder: QBUF(OUTPUT) failed: "
+-			  << strerror(errno) << std::endl;
+-		return 0;
++		return failed();
+ 	}
+ 
+ 	/* Queue the empty capture buffer to receive the MJPEG frame. */
+@@ -396,43 +471,58 @@
+ 	plane.length = cap_buf_.length;
+ 
+ 	if (xioctl(fd_, VIDIOC_QBUF, &buf) == -1) {
+-		std::cerr << "HwMjpegEncoder: QBUF(CAPTURE) failed: "
+-			  << strerror(errno) << std::endl;
+-		return 0;
+-	}
+-
+-	/* Dequeue the consumed raw buffer (blocking). */
++		return failed();
++	}
++
++	/* Dequeue the consumed raw buffer with a shared frame deadline. */
++	const auto output_start = std::chrono::steady_clock::now();
+ 	memset(&buf, 0, sizeof(buf));
+ 	memset(&plane, 0, sizeof(plane));
+ 	buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+ 	buf.memory = V4L2_MEMORY_DMABUF;
+ 	buf.length = 1;
+ 	buf.m.planes = &plane;
+-	if (xioctl(fd_, VIDIOC_DQBUF, &buf) == -1) {
+-		std::cerr << "HwMjpegEncoder: DQBUF(OUTPUT) failed: "
+-			  << strerror(errno) << std::endl;
+-		return 0;
+-	}
+-
+-	/* Dequeue the finished MJPEG buffer (blocking). */
++	if (!dequeue(buf, deadline)) {
++		return failed();
++	}
++
++	const auto capture_start = std::chrono::steady_clock::now();
++	output_wait_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
++		capture_start - output_start).count();
++	bool input_error = buf.flags & V4L2_BUF_FLAG_ERROR;
++
++	/* Dequeue the finished MJPEG buffer within the same deadline. */
+ 	memset(&buf, 0, sizeof(buf));
+ 	memset(&plane, 0, sizeof(plane));
+ 	buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+ 	buf.memory = V4L2_MEMORY_MMAP;
+ 	buf.length = 1;
+ 	buf.m.planes = &plane;
+-	if (xioctl(fd_, VIDIOC_DQBUF, &buf) == -1) {
+-		std::cerr << "HwMjpegEncoder: DQBUF(CAPTURE) failed: "
+-			  << strerror(errno) << std::endl;
+-		return 0;
+-	}
+-
+-	size_t bytesused = buf.m.planes[0].bytesused;
+-	if (bytesused == 0)
+-		return 0;
+-	if (bytesused > dest_size)
+-		bytesused = dest_size;
+-
+-	memcpy(dest, cap_buf_.mem, bytesused);
+-	return bytesused;
+-}
++	if (!dequeue(buf, deadline)) {
++		return failed();
++	}
++
++	capture_wait_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
++		std::chrono::steady_clock::now() - capture_start).count();
++	size_t bytesused = plane.bytesused;
++	size_t offset = plane.data_offset;
++	if (input_error || (buf.flags & V4L2_BUF_FLAG_ERROR)) {
++		++corrupt_;
++		return finish(0);
++	}
++	if (buf.index != 0 || buf.length != 1 || bytesused <= offset ||
++	    bytesused > cap_buf_.length || bytesused - offset > dest_size) {
++		++invalid_;
++		return finish(0);
++	}
++	bytesused -= offset;
++	const uint8_t *data = static_cast<const uint8_t *>(cap_buf_.mem) + offset;
++	/* A truncated JPEG must not become a successful short UVC frame. */
++	if (bytesused < 4 || data[0] != 0xff || data[1] != 0xd8 ||
++	    data[bytesused - 2] != 0xff || data[bytesused - 1] != 0xd9) {
++		++invalid_;
++		return finish(0);
++	}
++	memcpy(dest, data, bytesused);
++	return finish(bytesused);
++}
+--- a/include/uvcgadget/mjpeg_encoder.hpp
++++ b/include/uvcgadget/mjpeg_encoder.hpp
+@@ -7,6 +7,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <condition_variable>
+ #include <memory>
+ #include <mutex>
+@@ -53,8 +54,8 @@
+ 	 */
+ 	void outputThread();
+ 
+-	bool abortEncode_;
+-	bool abortOutput_;
++	std::atomic<bool> abortEncode_;
++	std::atomic<bool> abortOutput_;
+ 	uint64_t index_;
+ 
+ 	/*
+--- a/lib/mjpeg_encoder.cpp
++++ b/lib/mjpeg_encoder.cpp
+@@ -63,9 +63,13 @@
+ MjpegEncoder::~MjpegEncoder()
+ {
+ 	abortEncode_ = true;
++	if (hw_encoder_)
++		hw_encoder_->Cancel();
++	encode_cond_var_.notify_all();
+ 	for (int i = 0; i < num_encode_threads_; i++)
+ 		encode_thread_[i].join();
+ 	abortOutput_ = true;
++	output_cond_var_.notify_all();
+ 	output_thread_.join();
+ }
+ 
+--- a/lib/libcamera-source.cpp
++++ b/lib/libcamera-source.cpp
+@@ -13,6 +13,8 @@
+ #include <iostream>
+ #include <memory.h>
+ #include <queue>
++#include <mutex>
++#include <atomic>
+ #include <stdlib.h>
+ #include <string>
+ #include <string.h>
+@@ -53,14 +55,21 @@
+ 	FrameBufferAllocator *allocator;
+ 	std::vector<std::unique_ptr<Request>> requests;
+ 	std::queue<Request *> completed_requests;
++	std::queue<video_buffer> encoded_buffers;
++	std::mutex completion_mutex;
++	std::atomic<bool> stopping{true};
++	std::atomic<bool> pipe_error_logged{false};
++	uint64_t encoded_frames = 0, dropped_frames = 0;
+ 	int pfds[2];
+ 
+-	MjpegEncoder *encoder;
++	MjpegEncoder *encoder = nullptr;
+ 	std::unordered_map<FrameBuffer *, Span<uint8_t>> mapped_buffers_;
+ 
+ 	struct video_buffer_set buffers;
+ 
+ 	void mapBuffer(const std::unique_ptr<FrameBuffer> &buffer);
++	void notifyCompletion();
++	void pipeError(const char *operation, int error);
+ 	void requestComplete(Request *request);
+ 	void outputReady(void *mem, size_t bytesused, int64_t timestamp, unsigned int cookie);
+ };
+@@ -84,11 +93,31 @@
+ 	}
+ }
+ 
++void libcamera_source::pipeError(const char *operation, int error)
++{
++	if (!pipe_error_logged.exchange(true))
++		std::cerr << "MJPEG source: completion pipe " << operation
++			  << " failed: " << strerror(error) << std::endl;
++}
++
++void libcamera_source::notifyCompletion()
++{
++	ssize_t result;
++	do {
++		result = write(pfds[1], "x", 1);
++	} while (result < 0 && errno == EINTR);
++	/* A full nonblocking pipe is already readable. Outstanding completions
++	 * are bounded by the small request pool, far below pipe capacity. */
++	if (result != 1 && !(result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)))
++		pipeError("write", result < 0 ? errno : EIO);
++}
++
+ void libcamera_source::requestComplete(Request *request)
+ {
+-	if (request->status() == Request::RequestCancelled)
++	if (stopping || request->status() == Request::RequestCancelled)
+ 		return;
+ 
++	std::lock_guard<std::mutex> lock(completion_mutex);
+ 	completed_requests.push(request);
+ 
+ 	/*
+@@ -97,12 +126,14 @@
+ 	 * the loop is polling the other end. Once the event loop picks up this
+ 	 * write it will run libcamera_source_video_process().
+ 	 */
+-	write(pfds[1], "x", 1);
++	notifyCompletion();
+ };
+ 
+ void libcamera_source::outputReady(void *mem, size_t bytesused, int64_t timestamp, unsigned int cookie)
+ {
+-	struct video_buffer buffer;
++	if (stopping)
++		return;
++	struct video_buffer buffer = {};
+ 
+ 	buffer.index = cookie;
+ 	buffer.mem = mem;
+@@ -110,28 +141,64 @@
+ 	buffer.timestamp.tv_sec = timestamp / 1000000;
+ 	buffer.timestamp.tv_usec = timestamp % 1000000;
+ 
+-	src.handler(src.handler_data, &src, &buffer);
+-}
++	std::lock_guard<std::mutex> lock(completion_mutex);
++	encoded_buffers.push(buffer);
++	notifyCompletion();
++}
++
++static int libcamera_source_queue_buffer(struct video_source *s, struct video_buffer *buf);
+ 
+ static void libcamera_source_video_process(void *d)
+ {
+ 	struct libcamera_source *src = (struct libcamera_source *)d;
+ 	Stream *stream = src->config->at(0).stream();
+ 	struct video_buffer buffer;
+-	Request *request;
++	Request *request = nullptr;
++	bool encoded = false;
+ 	char buf;
+ 
+ 	/*
+ 	 * We need to perform a read here or the fd will stay active each time
+ 	 * the event loop cycles.
+ 	 */
+-	read(src->pfds[0], &buf, 1);
+-
+-	if (src->completed_requests.empty())
++	ssize_t received;
++	do {
++		received = read(src->pfds[0], &buf, 1);
++	} while (received < 0 && errno == EINTR);
++	if (received != 1) {
++		if (!(received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)))
++			src->pipeError("read", received < 0 ? errno : EPIPE);
+ 		return;
+-
+-	request = src->completed_requests.front();
+-	src->completed_requests.pop();
++	}
++
++	{
++		std::lock_guard<std::mutex> lock(src->completion_mutex);
++		if (!src->encoded_buffers.empty()) {
++			buffer = src->encoded_buffers.front();
++			src->encoded_buffers.pop();
++			encoded = true;
++		} else if (!src->completed_requests.empty()) {
++			request = src->completed_requests.front();
++			src->completed_requests.pop();
++		}
++	}
++	if (src->stopping)
++		return;
++	if (encoded) {
++		++src->encoded_frames;
++		if (!buffer.bytesused) {
++			++src->dropped_frames;
++			/* Destination is permanently paired with this request cookie.
++			 * Requeueing the request releases both slots; never QBUF zero
++			 * to UVC, where vb2 substitutes the full allocation length. */
++			libcamera_source_queue_buffer(&src->src, &buffer);
++		} else {
++			src->src.handler(src->src.handler_data, &src->src, &buffer);
++		}
++		return;
++	}
++	if (!request)
++		return;
+ 
+ 	/* We have only a single buffer per request, so just pick the first */
+ 	FrameBuffer *framebuf = request->buffers().begin()->second;
+@@ -148,7 +215,7 @@
+ 		auto span = src->mapped_buffers_.find(framebuf);
+ 		void *mem = span->second.data();
+ 		void *dest = src->buffers.buffers[request->cookie()].mem;
+-		unsigned int size = span->second.size();
++		unsigned int size = src->buffers.buffers[request->cookie()].size;
+ 		/* DMA-BUF fd of the frame, for the encoder's zero-copy import. */
+ 		int dmabuf_fd = framebuf->planes()[0].fd.get();
+ 
+@@ -376,8 +443,10 @@
+ {
+ 	struct libcamera_source *src = to_libcamera_source(s);
+ 
+-	for (unsigned int i = 0; i < buffers->nbufs; i++)
++	for (unsigned int i = 0; i < buffers->nbufs; i++) {
+ 		src->buffers.buffers[i].mem = buffers->buffers[i].mem;
++		src->buffers.buffers[i].size = buffers->buffers[i].size;
++	}
+ 
+ 	return 0;
+ }
+@@ -424,6 +493,9 @@
+ 		src->requests.push_back(std::move(request));
+ 	}
+ 
++	src->pipe_error_logged = false;
++	src->stopping = false;
++	src->encoded_frames = src->dropped_frames = 0;
+ 	ret = src->camera->start(&src->controls);
+ 	if (ret) {
+ 		std::cerr << "failed to start camera" << std::endl;
+@@ -456,17 +528,27 @@
+ {
+ 	struct libcamera_source *src = to_libcamera_source(s);
+ 
++	src->stopping = true;
+ 	src->camera->stop();
+ 	events_unwatch_fd(src->src.events, src->pfds[0], EVENT_READ);
++	/* Workers must finish before destroying the requests or mapped memory. */
++	delete src->encoder;
++	src->encoder = nullptr;
++	{
++		std::lock_guard<std::mutex> lock(src->completion_mutex);
++		while (!src->completed_requests.empty()) src->completed_requests.pop();
++		while (!src->encoded_buffers.empty()) src->encoded_buffers.pop();
++	}
+ 	src->requests.clear();
+-
+-	while (!src->completed_requests.empty())
+-		src->completed_requests.pop();
+-
+-	if (src->src.type == VIDEO_SOURCE_ENCODED) {
+-		delete src->encoder;
+-		src->encoder = nullptr;
+-	}
++	char pending[128];
++	ssize_t received;
++	do {
++		received = read(src->pfds[0], pending, sizeof(pending));
++	} while (received > 0 || (received < 0 && errno == EINTR));
++	if (!(received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)))
++		src->pipeError("drain", received < 0 ? errno : EPIPE);
++	std::cerr << "MJPEG source: completed=" << src->encoded_frames
++		  << " dropped=" << src->dropped_frames << std::endl;
+ 
+ 	/*
+ 	 * We need to reinitialise this here, as if the user selected an
+@@ -483,6 +565,8 @@
+ {
+ 	struct libcamera_source *src = to_libcamera_source(s);
+ 
++	if (src->stopping)
++		return 0;
+ 	for (std::unique_ptr<Request> &r : src->requests) {
+ 		if (r->cookie() == buf->index) {
+ 			r->reuse(Request::ReuseBuffers);

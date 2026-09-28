@@ -1,0 +1,6 @@
+# Buildroot output belongs to the nested buildroot checkout, not this repository.
+.DS_Store
+._*
+.idea/
+__pycache__/
+*.py[cod]

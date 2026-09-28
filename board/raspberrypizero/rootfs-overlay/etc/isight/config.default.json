@@ -8,5 +8,12 @@
   "ev": 0,
   "logo_light": "activity",
   "quality": 72,
-  "microphone": true
+  "microphone": true,
+  "audio": {
+    "gain_db": 0,
+    "highpass_hz": 80,
+    "lowpass_hz": 8000,
+    "bypass": false
+  },
+  "diagnostics": false
 }

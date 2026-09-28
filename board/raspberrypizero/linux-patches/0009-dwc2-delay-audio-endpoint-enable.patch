@@ -1,0 +1,555 @@
+Subject: [PATCH] usb: dwc2: defer interval-eight IN endpoint enable
+
+Keep DMA request ownership while postponing EPENA to target minus three
+microframes. Guard timer lifetime and preserve late request recovery.
+Expose scheduling/CPU counters. This policy only applies to high-speed
+buffer-DMA interval-eight IN endpoints. Runtime low-resolution timers
+retain immediate enabling.
+
+Prepared requests delayed beyond two milliseconds resynchronize on a
+host NAK instead of reconstructing an ambiguous elapsed SOF count.
+
+Hardware performance is not established by native source tests.
+---
+
+--- a/drivers/usb/dwc2/core.h
++++ b/drivers/usb/dwc2/core.h
+@@ -16,6 +16,7 @@
+ #include <linux/usb/phy.h>
+ #include "hw.h"
+ #include "isoc-diag.h"
++#include <linux/hrtimer.h>
+ 
+ /*
+  * Suggested defines for tracers:
+@@ -132,6 +133,16 @@
+ 	struct dwc2_isoc_diag_sample first, last, worst;
+ };
+ 
++struct dwc2_isoc_arm {
++	struct hrtimer timer;
++	struct dwc2_hsotg_req *request;
++	bool initialized, prepared, pending;
++	u32 target, session, epoch;
++	u64 started_ns, deadline_ns;
++	u64 scheduled, armed, late, early, cancelled, lateness_ns_max, resync;
++	u64 callbacks, callback_ns, callback_ns_max;
++};
++
+ struct dwc2_hsotg_ep {
+ 	struct usb_ep           ep;
+ 	struct list_head        queue;
+@@ -163,6 +174,7 @@
+ 	struct dwc2_isoc_diag isoc_diag[4];
+ 	u32 diag_irq, diag_sessions;
+ 	struct dwc2_diag_arm diag_arm;
++	struct dwc2_isoc_arm arm;
+ 	/* Identity of an IN request spared an old incomplete interrupt. */
+ 	struct {
+ 		u64 ns;
+@@ -1075,6 +1087,7 @@
+  */
+ struct dwc2_hsotg {
+ 	struct dwc2_irq_diag irq_diag;
++	u32 arm_epoch;
+ 	struct device *dev;
+ 	void __iomem *regs;
+ 	/** Params detected from hardware */
+@@ -1439,6 +1452,7 @@
+ void dwc2_hsotg_core_disconnect(struct dwc2_hsotg *hsotg);
+ void dwc2_hsotg_core_connect(struct dwc2_hsotg *hsotg);
+ void dwc2_hsotg_disconnect(struct dwc2_hsotg *dwc2);
++void dwc2_gadget_cancel_isoc_arming(struct dwc2_hsotg *hsotg);
+ int dwc2_hsotg_set_test_mode(struct dwc2_hsotg *hsotg, int testmode);
+ #define dwc2_is_device_connected(hsotg) (hsotg->connected)
+ #define dwc2_is_device_enabled(hsotg) (hsotg->enabled)
+@@ -1474,6 +1488,7 @@
+ static inline void dwc2_hsotg_core_disconnect(struct dwc2_hsotg *hsotg) {}
+ static inline void dwc2_hsotg_core_connect(struct dwc2_hsotg *hsotg) {}
+ static inline void dwc2_hsotg_disconnect(struct dwc2_hsotg *dwc2) {}
++static inline void dwc2_gadget_cancel_isoc_arming(struct dwc2_hsotg *hsotg) {}
+ static inline int dwc2_hsotg_set_test_mode(struct dwc2_hsotg *hsotg,
+ 					   int testmode)
+ { return 0; }
+--- a/drivers/usb/dwc2/core_intr.c
++++ b/drivers/usb/dwc2/core_intr.c
+@@ -864,7 +864,9 @@
+ 
+ 	gintsts = dwc2_read_common_intr(hsotg);
+ 	if (gintsts & (GINTSTS_MODEMIS | GINTSTS_CONIDSTSCHNG |
+-		       GINTSTS_DISCONNINT | GINTSTS_USBSUSP | GINTSTS_WKUPINT)) {
++		       GINTSTS_DISCONNINT | GINTSTS_USBSUSP | GINTSTS_WKUPINT |
++		       GINTSTS_LPMTRANRCVD)) {
++		dwc2_gadget_cancel_isoc_arming(hsotg);
+ 		hsotg->irq_diag.last_valid = false;
+ 		hsotg->irq_diag.current_valid = false;
+ 	}
+--- a/drivers/usb/dwc2/gadget.c
++++ b/drivers/usb/dwc2/gadget.c
+@@ -1223,6 +1223,183 @@
+ 				     d->previous_ns, *frame, *ns, d->dcfg);
+ }
+ 
++/* Prepared requests retain DMA ownership; only EPENA is postponed. */
++static void dwc2_isoc_arm_cancel(struct dwc2_hsotg_ep *ep)
++{
++	if (ep->arm.pending)
++		ep->arm.cancelled++;
++	ep->arm.pending = false;
++	ep->arm.prepared = false;
++	if (ep->arm.initialized)
++		hrtimer_try_to_cancel(&ep->arm.timer);
++}
++
++/* Called under hsotg->lock before reset or power-state changes. */
++void dwc2_gadget_cancel_isoc_arming(struct dwc2_hsotg *hsotg)
++{
++	unsigned int i;
++
++	hsotg->arm_epoch++;
++	for (i = 1; i < hsotg->num_of_eps; i++) {
++		struct dwc2_hsotg_ep *ep = hsotg->eps_in[i];
++
++		if (!ep || !ep->arm.initialized)
++			continue;
++		if (ep->arm.pending)
++			ep->arm.cancelled++;
++		ep->arm.pending = false;
++		/* Keep prepared until completion: hardware was never enabled. */
++		hrtimer_try_to_cancel(&ep->arm.timer);
++	}
++}
++
++static bool dwc2_isoc_arm_expired(struct dwc2_hsotg_ep *ep)
++{
++	u32 distance;
++	u64 now;
++
++	if (!ep->arm.prepared || !ep->req ||
++	    ep->arm.request != ep->req ||
++	    ep->arm.target != ep->target_frame ||
++	    ep->arm.session != ep->diag_sessions)
++		return false;
++	distance = (ep->target_frame - ep->parent->frame_number) &
++		   DSTS_SOFFN_LIMIT;
++	now = ktime_get_ns();
++	/* A delayed callback must not confuse an entire counter wrap with future. */
++	return !distance || distance >= 0x2000 ||
++	       (now >= ep->arm.started_ns &&
++		now - ep->arm.started_ns >= 2000000);
++}
++
++static void dwc2_isoc_write_epena(struct dwc2_hsotg_ep *ep, u32 ctrl)
++{
++	struct dwc2_hsotg *hsotg = ep->parent;
++	u32 reg = ep->dir_in ? DIEPCTL(ep->index) : DOEPCTL(ep->index);
++
++	if (ep->arm.prepared) {
++		ep->arm.armed++;
++		ep->arm.prepared = false;
++		ep->arm.pending = false;
++	}
++	if (ep->isochronous && ep->dir_in) {
++		ep->diag_arm.serial++;
++		ep->diag_arm.target = ep->target_frame;
++		ep->diag_arm.length = ep->size_loaded;
++		ep->diag_arm.before_frame = dwc2_hsotg_read_frameno(hsotg);
++	}
++	dwc2_writel(hsotg, ctrl, reg);
++	if (ep->isochronous && ep->dir_in)
++		ep->diag_arm.after_frame = dwc2_hsotg_read_frameno(hsotg);
++}
++
++static enum hrtimer_restart dwc2_isoc_arm_timer(struct hrtimer *timer)
++{
++	struct dwc2_isoc_arm *arm = container_of(timer, struct dwc2_isoc_arm,
++					       timer);
++	struct dwc2_hsotg_ep *ep = container_of(arm, struct dwc2_hsotg_ep, arm);
++	struct dwc2_hsotg *hsotg = ep->parent;
++	unsigned long flags;
++	u64 entered_ns = ktime_get_ns();
++	u64 now, elapsed;
++	u32 ctrl, dsts, status, distance;
++
++	spin_lock_irqsave(&hsotg->lock, flags);
++	arm->callbacks++;
++	if (!arm->pending)
++		goto out;
++	now = ktime_get_ns();
++	/* A previous callback may have waited while a replacement was queued. */
++	if (now < arm->deadline_ns)
++		goto out;
++	arm->pending = false;
++	arm->lateness_ns_max = max(arm->lateness_ns_max,
++				   now - arm->deadline_ns);
++	/* Never read registers when software already knows clocks are off. */
++	if (!hsotg->ll_hw_enabled || hsotg->hibernated || hsotg->in_ppd ||
++	    hsotg->bus_suspended || hsotg->lx_state != DWC2_L0 ||
++	    !arm->prepared || !ep->req || arm->request != ep->req ||
++	    arm->session != ep->diag_sessions ||
++	    arm->target != ep->target_frame || arm->epoch != hsotg->arm_epoch)
++		goto out;
++	status = dwc2_readl(hsotg, GINTSTS);
++	dsts = dwc2_readl(hsotg, DSTS);
++	if (!dwc2_isoc_epoch_valid(hsotg, dsts, status) ||
++	    status & (GINTSTS_CURMODE_HOST | GINTSTS_LPMTRANRCVD))
++		goto out;
++	hsotg->frame_number = (dsts & DSTS_SOFFN_MASK) >> DSTS_SOFFN_SHIFT;
++	if (dwc2_isoc_arm_expired(ep)) {
++		arm->late++;
++		/* Host NAK recovery owns retirement, including PCM consumption. */
++		goto out;
++	}
++	ctrl = dwc2_readl(hsotg, DIEPCTL(ep->index));
++	if (!(ctrl & DXEPCTL_USBACTEP) ||
++	    ctrl & (DXEPCTL_EPENA | DXEPCTL_STALL))
++		goto out;
++	if (dwc2_readl(hsotg, DIEPINT(ep->index)) &
++	    (DXEPINT_NAKINTRPT | DXEPINT_EPDISBLD | DXEPINT_XFERCOMPL))
++		goto out;
++	/* The register checks above can straddle SOF or a bus transition. */
++	status = dwc2_readl(hsotg, GINTSTS);
++	dsts = dwc2_readl(hsotg, DSTS);
++	if (!dwc2_isoc_epoch_valid(hsotg, dsts, status) ||
++	    status & (GINTSTS_CURMODE_HOST | GINTSTS_LPMTRANRCVD))
++		goto out;
++	hsotg->frame_number = (dsts & DSTS_SOFFN_MASK) >> DSTS_SOFFN_SHIFT;
++	if (dwc2_isoc_arm_expired(ep)) {
++		arm->late++;
++		goto out;
++	}
++	distance = (ep->target_frame - hsotg->frame_number) & DSTS_SOFFN_LIMIT;
++	if (distance > 3)
++		arm->early++;
++	/* Use live control bits; do not replay a saved register snapshot. */
++	ctrl &= ~(DXEPCTL_EPDIS | DXEPCTL_SNAK);
++	ctrl |= DXEPCTL_EPENA | DXEPCTL_CNAK;
++	dwc2_isoc_write_epena(ep, ctrl);
++out:
++	elapsed = ktime_get_ns() - entered_ns;
++	arm->callback_ns += elapsed;
++	arm->callback_ns_max = max(arm->callback_ns_max, elapsed);
++	spin_unlock_irqrestore(&hsotg->lock, flags);
++	return HRTIMER_NORESTART;
++}
++
++static bool dwc2_isoc_prepare_arm(struct dwc2_hsotg_ep *ep)
++{
++	struct dwc2_hsotg *hsotg = ep->parent;
++	struct dwc2_isoc_arm *arm = &ep->arm;
++	u32 distance, frame;
++	u64 now;
++
++	if (!arm->initialized || !hrtimer_is_hres_active(&arm->timer) ||
++	    !ep->isochronous || !ep->dir_in || ep->interval != 8 ||
++	    hsotg->gadget.speed != USB_SPEED_HIGH || !using_dma(hsotg) ||
++	    using_desc_dma(hsotg) || !hsotg->ll_hw_enabled ||
++	    hsotg->lx_state != DWC2_L0 || hsotg->bus_suspended ||
++	    hsotg->hibernated || hsotg->in_ppd)
++		return false;
++	frame = dwc2_hsotg_read_frameno(hsotg);
++	now = ktime_get_ns();
++	distance = (ep->target_frame - frame) & DSTS_SOFFN_LIMIT;
++	if (distance <= 3 || distance > 8 ||
++	    dwc2_readl(hsotg, DIEPCTL(ep->index)) & DXEPCTL_EPENA)
++		return false;
++	arm->request = ep->req;
++	arm->target = ep->target_frame;
++	arm->session = ep->diag_sessions;
++	arm->epoch = hsotg->arm_epoch;
++	arm->started_ns = now;
++	arm->deadline_ns = now + (distance - 3) * 125000ULL;
++	arm->prepared = true;
++	arm->pending = true;
++	arm->scheduled++;
++	hrtimer_start(&arm->timer, ns_to_ktime(arm->deadline_ns),
++		      HRTIMER_MODE_ABS_PINNED);
++	return true;
++}
++
+ static bool dwc2_gadget_target_frame_elapsed(struct dwc2_hsotg_ep *hs_ep);
+ static void dwc2_hsotg_complete_request(struct dwc2_hsotg *hsotg,
+ 					struct dwc2_hsotg_ep *hs_ep,
+@@ -1409,23 +1586,14 @@
+ 		ctrl |= DXEPCTL_CNAK;	/* clear NAK set by core */
+ 
+ 	dev_dbg(hsotg->dev, "%s: DxEPCTL=0x%08x\n", __func__, ctrl);
+-	if (hs_ep->isochronous && hs_ep->dir_in) {
+-		hs_ep->diag_arm.serial++;
+-		hs_ep->diag_arm.target = hs_ep->target_frame;
+-		hs_ep->diag_arm.length = length;
+-		hs_ep->diag_arm.before_frame = dwc2_hsotg_read_frameno(hsotg);
+-	}
+-	dwc2_writel(hsotg, ctrl, epctrl_reg);
+-	if (hs_ep->isochronous && hs_ep->dir_in)
+-		hs_ep->diag_arm.after_frame = dwc2_hsotg_read_frameno(hsotg);
+-
+-	/*
+-	 * set these, it seems that DMA support increments past the end
+-	 * of the packet buffer so we need to calculate the length from
+-	 * this information.
+-	 */
++	/* Publish accounting before the timer can enable the prepared request. */
+ 	hs_ep->size_loaded = length;
+ 	hs_ep->last_load = ureq->actual;
++	if (!continuing && dwc2_isoc_prepare_arm(hs_ep)) {
++		dwc2_hsotg_ctrl_epint(hsotg, hs_ep->index, hs_ep->dir_in, 1);
++		return;
++	}
++	dwc2_isoc_write_epena(hs_ep, ctrl);
+ 
+ 	if (dir_in && !using_dma(hsotg)) {
+ 		/* set these anyway, we may need them for non-periodic in */
+@@ -2340,6 +2508,9 @@
+ 	if (hs_req->req.status == -EINPROGRESS)
+ 		hs_req->req.status = result;
+ 
++	if (hs_ep->req == hs_req)
++		dwc2_isoc_arm_cancel(hs_ep);
++
+ 	if (using_dma(hsotg))
+ 		dwc2_hsotg_unmap_dma(hsotg, hs_ep, hs_req);
+ 
+@@ -2348,8 +2519,10 @@
+ 	if (hs_ep->req == hs_req && !hs_req->req.status &&
+ 	    dwc2_isoc_deferred_matches(hsotg, hs_ep))
+ 		hsotg->irq_diag.deferred_completed++;
+-	hs_ep->deferred.valid = false;
+-	hs_ep->req = NULL;
++	if (hs_ep->req == hs_req) {
++		hs_ep->deferred.valid = false;
++		hs_ep->req = NULL;
++	}
+ 	list_del_init(&hs_req->queue);
+ 
+ 	/*
+@@ -3172,6 +3345,7 @@
+ 	u32 diag_burst = 0;
+ 	int dir_in = hs_ep->dir_in;
+ 	u32 ctrl;
++	bool resync = false;
+ 
+ 	if (!dir_in || !hs_ep->isochronous)
+ 		return;
+@@ -3224,12 +3398,48 @@
+ 	else
+ 		dwc2_hsotg_txfifo_flush(hsotg, hs_ep->fifo_index);
+ 
+-	while (dwc2_gadget_target_frame_elapsed(hs_ep)) {
++	if (hs_ep->arm.prepared && hs_ep->req == hs_ep->arm.request &&
++	    hs_ep->arm.target == hs_ep->target_frame &&
++	    hs_ep->arm.session == hs_ep->diag_sessions &&
++	    ktime_get_ns() - hs_ep->arm.started_ns >= 2000000) {
++		/* After a discontinuity elapsed SOFs cannot be reconstructed.
++		 * Resynchronize to the latest same-phase slot, retire one stale
++		 * request, and retain the remaining bounded gadget queue.
++		 */
++		u32 phase = (hsotg->frame_number - hs_ep->target_frame) & 7;
++
++		hs_ep->target_frame = (hsotg->frame_number - phase) &
++				      DSTS_SOFFN_LIMIT;
++		hs_ep->frame_overrun = false;
++		hs_ep->arm.resync++;
++		resync = true;
++	}
++
++	while (resync || dwc2_gadget_target_frame_elapsed(hs_ep) ||
++	       dwc2_isoc_arm_expired(hs_ep)) {
++		resync = false;
+ 		hs_req = get_ep_head(hs_ep);
+ 		if (hs_req) {
+ 			hs_req->req.frame_number = hs_ep->target_frame;
+ 			hs_req->req.actual = 0;
+ 			dwc2_isoc_diag_miss(hs_ep, 3, ++diag_burst, hs_req);
++			if (hs_ep->arm.prepared && hs_ep->req == hs_req) {
++				u32 session = hs_ep->diag_sessions;
++				u32 epoch = hsotg->arm_epoch;
++
++				/* Publish next slot before a callback can requeue. */
++				dwc2_gadget_incr_frame_num(hs_ep);
++				dwc2_hsotg_complete_request(hsotg, hs_ep, hs_req,
++							    -ENODATA);
++				if (hs_ep->diag_sessions != session ||
++				    hsotg->arm_epoch != epoch ||
++				    !hsotg->ll_hw_enabled || hsotg->hibernated ||
++				    hsotg->in_ppd || hsotg->bus_suspended ||
++				    hsotg->lx_state != DWC2_L0)
++					return;
++				hsotg->frame_number = dwc2_hsotg_read_frameno(hsotg);
++				continue;
++			}
+ 			dwc2_hsotg_complete_request(hsotg, hs_ep, hs_req, -ENODATA);
+ 		}
+ 
+@@ -3240,6 +3450,14 @@
+ 
+ 	if (!hs_ep->req)
+ 		dwc2_gadget_start_next_request(hs_ep);
++	else if (hs_ep->arm.prepared && !hs_ep->arm.pending) {
++		/* A pending NAK may have made the timer yield to this handler. */
++		hs_ep->arm.deadline_ns = ktime_get_ns();
++		hs_ep->arm.pending = true;
++		hrtimer_start(&hs_ep->arm.timer,
++			      ns_to_ktime(hs_ep->arm.deadline_ns),
++			      HRTIMER_MODE_ABS_PINNED);
++	}
+ }
+ 
+ /**
+@@ -3518,6 +3736,7 @@
+ {
+ 	unsigned int size;
+ 
++	dwc2_isoc_arm_cancel(ep);
+ 	ep->req = NULL;
+ 
+ 	while (!list_empty(&ep->queue)) {
+@@ -3544,6 +3763,8 @@
+ void dwc2_hsotg_disconnect(struct dwc2_hsotg *hsotg)
+ {
+ 	unsigned int ep;
++	dwc2_gadget_cancel_isoc_arming(hsotg);
++
+ 	hsotg->irq_diag.last_valid = false;
+ 	hsotg->irq_diag.current_valid = false;
+ 
+@@ -3620,6 +3841,8 @@
+ 	u32 usbcfg;
+ 	u32 dcfg = 0;
+ 	int ep;
++	dwc2_gadget_cancel_isoc_arming(hsotg);
++
+ 	hsotg->irq_diag.last_valid = false;
+ 	hsotg->irq_diag.current_valid = false;
+ 
+@@ -4354,6 +4577,7 @@
+ 	}
+ 
+ 	spin_lock_irqsave(&hsotg->lock, flags);
++	dwc2_isoc_arm_cancel(hs_ep);
+ 
+ 	epctrl &= ~(DXEPCTL_EPTYPE_MASK | DXEPCTL_MPS_MASK);
+ 	epctrl |= DXEPCTL_MPS(mps);
+@@ -4528,6 +4752,7 @@
+ 		return -EINVAL;
+ 	}
+ 
++	dwc2_isoc_arm_cancel(hs_ep);
+ 	epctrl_reg = dir_in ? DIEPCTL(index) : DOEPCTL(index);
+ 
+ 	ctrl = dwc2_readl(hsotg, epctrl_reg);
+@@ -4606,8 +4831,8 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	/* Dequeue already started request */
+-	if (req == &hs_ep->req->req)
++	/* A prepared request owns DMA but has never enabled hardware. */
++	if (hs_ep->req == hs_req && !hs_ep->arm.prepared)
+ 		dwc2_hsotg_ep_stop_xfr(hs, hs_ep);
+ 
+ 	dwc2_hsotg_complete_request(hs, hs_ep, hs_req, -ECONNRESET);
+@@ -5088,6 +5313,9 @@
+ 		list_add_tail(&hs_ep->ep.ep_list, &hsotg->gadget.ep_list);
+ 
+ 	hs_ep->parent = hsotg;
++	hrtimer_init(&hs_ep->arm.timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_PINNED);
++	hs_ep->arm.timer.function = dwc2_isoc_arm_timer;
++	hs_ep->arm.initialized = true;
+ 	hs_ep->ep.name = hs_ep->name;
+ 
+ 	if (hsotg->params.speed == DWC2_SPEED_PARAM_LOW)
+@@ -5347,7 +5575,19 @@
+  */
+ int dwc2_hsotg_remove(struct dwc2_hsotg *hsotg)
+ {
++	unsigned long flags;
++	unsigned int i;
++
+ 	usb_del_gadget_udc(&hsotg->gadget);
++	spin_lock_irqsave(&hsotg->lock, flags);
++	dwc2_gadget_cancel_isoc_arming(hsotg);
++	spin_unlock_irqrestore(&hsotg->lock, flags);
++	for (i = 1; i < hsotg->num_of_eps; i++) {
++		struct dwc2_hsotg_ep *ep = hsotg->eps_in[i];
++
++		if (ep && ep->arm.initialized)
++			hrtimer_cancel(&ep->arm.timer);
++	}
+ 	dwc2_hsotg_ep_free_request(&hsotg->eps_out[0]->ep, hsotg->ctrl_req);
+ 
+ 	return 0;
+@@ -5591,6 +5831,8 @@
+ 	u32 pcgcctl;
+ 	int ret = 0;
+ 
++	dwc2_gadget_cancel_isoc_arming(hsotg);
++
+ 	/* Change to L2(suspend) state */
+ 	hsotg->lx_state = DWC2_L2;
+ 	dev_dbg(hsotg->dev, "Start of hibernation completed\n");
+@@ -5797,6 +6039,8 @@
+ 
+ 	dev_dbg(hsotg->dev, "Entering device partial power down started.\n");
+ 
++	dwc2_gadget_cancel_isoc_arming(hsotg);
++
+ 	/* Backup all registers */
+ 	ret = dwc2_backup_global_registers(hsotg);
+ 	if (ret) {
+@@ -5923,6 +6167,8 @@
+ 
+ 	dev_dbg(hsotg->dev, "Entering device clock gating.\n");
+ 
++	dwc2_gadget_cancel_isoc_arming(hsotg);
++
+ 	/* Set the Phy Clock bit as suspend is received. */
+ 	pcgctl = dwc2_readl(hsotg, PCGCTL);
+ 	pcgctl |= PCGCTL_STOPPCLK;
+--- a/drivers/usb/dwc2/debugfs.c
++++ b/drivers/usb/dwc2/debugfs.c
+@@ -349,6 +349,7 @@
+ 	unsigned long flags;
+ 	int ret;
+ 
++	seq_puts(seq, "irq_arm_policy interval=8 lead=3\n");
+ 	ret = dwc2_diag_show_irq(seq, hsotg);
+ 	if (ret)
+ 		return ret;
+@@ -358,6 +359,7 @@
+ 			struct dwc2_hsotg_ep *ep = direction ?
+ 				hsotg->eps_in[index] : hsotg->eps_out[index];
+ 			struct dwc2_isoc_diag saved[4];
++			u64 arm[10];
+ 			u32 sessions;
+ 			u16 interval;
+ 			bool dma, ddma;
+@@ -365,6 +367,16 @@
+ 			if (!ep)
+ 				continue;
+ 			spin_lock_irqsave(&hsotg->lock, flags);
++			arm[0] = ep->arm.scheduled;
++			arm[1] = ep->arm.armed;
++			arm[2] = ep->arm.late;
++			arm[3] = ep->arm.early;
++			arm[4] = ep->arm.cancelled;
++			arm[5] = ep->arm.lateness_ns_max;
++			arm[6] = ep->arm.resync;
++			arm[7] = ep->arm.callbacks;
++			arm[8] = ep->arm.callback_ns;
++			arm[9] = ep->arm.callback_ns_max;
+ 			sessions = ep->diag_sessions;
+ 			interval = ep->interval;
+ 			dma = hsotg->params.g_dma;
+@@ -375,6 +387,11 @@
+ 				continue;
+ 			seq_printf(seq, "%s sessions=%u interval=%u dma=%u ddma=%u\n",
+ 				   ep->ep.name, sessions, interval, dma, ddma);
++			if (direction && interval == 8)
++				seq_printf(seq, "%s arm scheduled=%llu armed=%llu late=%llu early=%llu cancelled=%llu lateness_max_ns=%llu resync=%llu callbacks=%llu callback_ns=%llu callback_max_ns=%llu\n",
++					   ep->ep.name, arm[0], arm[1], arm[2],
++					   arm[3], arm[4], arm[5], arm[6],
++					   arm[7], arm[8], arm[9]);
+ 			for (i = 0; i < 4; ++i) {
+ 				struct dwc2_isoc_diag *d = &saved[i];
+ 				const struct dwc2_isoc_diag_sample *samples[] = {

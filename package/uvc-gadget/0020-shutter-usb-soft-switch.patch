@@ -1,0 +1,904 @@
+From: PiSight maintainers <pisight@localhost>
+Subject: [PATCH] Use GPIO edge events for a shutter-controlled USB soft switch
+
+Opt-in -S uses the PiSight GPIO 26 IR shutter. Kernel debounce and the existing
+select loop avoid sampling workers or periodic input reads. Keep USB stopped
+until the initial shutter state and event handlers are ready; toggle the UDC
+soft connection while retaining the configured UVC/UAC2 functions. Stop video
+on close/disconnect and reject queued starts until reopened. GPIO/USB errors
+stop the application and deactivate the composite gadget.
+
+The old ARM toolchain predates GPIO v2. Include an unmodified UAPI gpio.h
+from the project's pinned Raspberry Pi kernel commit
+cd231d4775b14f228606c09f219b48308f6ab3aa (include/uapi/linux/gpio.h).
+Its SPDX license and copyright are preserved. No runtime dependency is added.
+
+--- a/include/uvcgadget/meson.build
++++ b/include/uvcgadget/meson.build
+@@ -7,6 +7,7 @@
+   'libcamera-source.h',
+   'list.h',
+   'stream.h',
++  'shutter.h',
+   'timer.h',
+   'v4l2-source.h',
+   'video-source.h',
+--- /dev/null
++++ b/include/uvcgadget/shutter.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef __SHUTTER_H__
++#define __SHUTTER_H__
++struct events;
++struct uvc_stream;
++struct shutter;
++/* PiSight IR shutter: GPIO 26 high=closed, low=open. */
++struct shutter *shutter_create(struct events *events, const char *udc);
++int shutter_start(struct shutter *shutter, struct uvc_stream *stream);
++void shutter_destroy(struct shutter *shutter);
++#endif
+--- a/include/uvcgadget/stream.h
++++ b/include/uvcgadget/stream.h
+@@ -117,6 +117,7 @@
+  * for the @stream. It must not be called directly by applications.
+  */
+ void uvc_stream_enable(struct uvc_stream *stream, int enable);
++void uvc_stream_set_shutter_closed(struct uvc_stream *stream, int closed);
+ 
+ /* Logo modes match the settings protocol: 0=off, 1=on, 2=activity. */
+ void uvc_stream_set_logo_mode(struct uvc_stream *stream, unsigned int mode);
+--- a/lib/meson.build
++++ b/lib/meson.build
+@@ -6,6 +6,7 @@
+   'jpg-source.c',
+   'slideshow-source.c',
+   'stream.c',
++  'shutter.c',
+   'test-source.c',
+   'timer.c',
+   'uvc.c',
+--- /dev/null
++++ b/lib/gpio-uapi.h
+@@ -0,0 +1,534 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
++/*
++ * <linux/gpio.h> - userspace ABI for the GPIO character devices
++ *
++ * Copyright (C) 2016 Linus Walleij
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ */
++#ifndef _UAPI_GPIO_H_
++#define _UAPI_GPIO_H_
++
++#include <linux/const.h>
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++/*
++ * The maximum size of name and label arrays.
++ *
++ * Must be a multiple of 8 to ensure 32/64-bit alignment of structs.
++ */
++#define GPIO_MAX_NAME_SIZE 32
++
++/**
++ * struct gpiochip_info - Information about a certain GPIO chip
++ * @name: the Linux kernel name of this GPIO chip
++ * @label: a functional name for this GPIO chip, such as a product
++ * number, may be empty (i.e. label[0] == '\0')
++ * @lines: number of GPIO lines on this chip
++ */
++struct gpiochip_info {
++	char name[GPIO_MAX_NAME_SIZE];
++	char label[GPIO_MAX_NAME_SIZE];
++	__u32 lines;
++};
++
++/*
++ * Maximum number of requested lines.
++ *
++ * Must be no greater than 64, as bitmaps are restricted here to 64-bits
++ * for simplicity, and a multiple of 2 to ensure 32/64-bit alignment of
++ * structs.
++ */
++#define GPIO_V2_LINES_MAX 64
++
++/*
++ * The maximum number of configuration attributes associated with a line
++ * request.
++ */
++#define GPIO_V2_LINE_NUM_ATTRS_MAX 10
++
++/**
++ * enum gpio_v2_line_flag - &struct gpio_v2_line_attribute.flags values
++ * @GPIO_V2_LINE_FLAG_USED: line is not available for request
++ * @GPIO_V2_LINE_FLAG_ACTIVE_LOW: line active state is physical low
++ * @GPIO_V2_LINE_FLAG_INPUT: line is an input
++ * @GPIO_V2_LINE_FLAG_OUTPUT: line is an output
++ * @GPIO_V2_LINE_FLAG_EDGE_RISING: line detects rising (inactive to active)
++ * edges
++ * @GPIO_V2_LINE_FLAG_EDGE_FALLING: line detects falling (active to
++ * inactive) edges
++ * @GPIO_V2_LINE_FLAG_OPEN_DRAIN: line is an open drain output
++ * @GPIO_V2_LINE_FLAG_OPEN_SOURCE: line is an open source output
++ * @GPIO_V2_LINE_FLAG_BIAS_PULL_UP: line has pull-up bias enabled
++ * @GPIO_V2_LINE_FLAG_BIAS_PULL_DOWN: line has pull-down bias enabled
++ * @GPIO_V2_LINE_FLAG_BIAS_DISABLED: line has bias disabled
++ * @GPIO_V2_LINE_FLAG_EVENT_CLOCK_REALTIME: line events contain REALTIME timestamps
++ * @GPIO_V2_LINE_FLAG_EVENT_CLOCK_HTE: line events contain timestamps from
++ * the hardware timestamping engine (HTE) subsystem
++ */
++enum gpio_v2_line_flag {
++	GPIO_V2_LINE_FLAG_USED			= _BITULL(0),
++	GPIO_V2_LINE_FLAG_ACTIVE_LOW		= _BITULL(1),
++	GPIO_V2_LINE_FLAG_INPUT			= _BITULL(2),
++	GPIO_V2_LINE_FLAG_OUTPUT		= _BITULL(3),
++	GPIO_V2_LINE_FLAG_EDGE_RISING		= _BITULL(4),
++	GPIO_V2_LINE_FLAG_EDGE_FALLING		= _BITULL(5),
++	GPIO_V2_LINE_FLAG_OPEN_DRAIN		= _BITULL(6),
++	GPIO_V2_LINE_FLAG_OPEN_SOURCE		= _BITULL(7),
++	GPIO_V2_LINE_FLAG_BIAS_PULL_UP		= _BITULL(8),
++	GPIO_V2_LINE_FLAG_BIAS_PULL_DOWN	= _BITULL(9),
++	GPIO_V2_LINE_FLAG_BIAS_DISABLED		= _BITULL(10),
++	GPIO_V2_LINE_FLAG_EVENT_CLOCK_REALTIME	= _BITULL(11),
++	GPIO_V2_LINE_FLAG_EVENT_CLOCK_HTE	= _BITULL(12),
++};
++
++/**
++ * struct gpio_v2_line_values - Values of GPIO lines
++ * @bits: a bitmap containing the value of the lines, set to 1 for active
++ * and 0 for inactive
++ * @mask: a bitmap identifying the lines to get or set, with each bit
++ * number corresponding to the index into &struct
++ * gpio_v2_line_request.offsets
++ */
++struct gpio_v2_line_values {
++	__aligned_u64 bits;
++	__aligned_u64 mask;
++};
++
++/**
++ * enum gpio_v2_line_attr_id - &struct gpio_v2_line_attribute.id values
++ * identifying which field of the attribute union is in use.
++ * @GPIO_V2_LINE_ATTR_ID_FLAGS: flags field is in use
++ * @GPIO_V2_LINE_ATTR_ID_OUTPUT_VALUES: values field is in use
++ * @GPIO_V2_LINE_ATTR_ID_DEBOUNCE: debounce_period_us field is in use
++ */
++enum gpio_v2_line_attr_id {
++	GPIO_V2_LINE_ATTR_ID_FLAGS		= 1,
++	GPIO_V2_LINE_ATTR_ID_OUTPUT_VALUES	= 2,
++	GPIO_V2_LINE_ATTR_ID_DEBOUNCE		= 3,
++};
++
++/**
++ * struct gpio_v2_line_attribute - a configurable attribute of a line
++ * @id: attribute identifier with value from &enum gpio_v2_line_attr_id
++ * @padding: reserved for future use and must be zero filled
++ * @flags: if id is %GPIO_V2_LINE_ATTR_ID_FLAGS, the flags for the GPIO
++ * line, with values from &enum gpio_v2_line_flag, such as
++ * %GPIO_V2_LINE_FLAG_ACTIVE_LOW, %GPIO_V2_LINE_FLAG_OUTPUT etc, added
++ * together.  This overrides the default flags contained in the &struct
++ * gpio_v2_line_config for the associated line.
++ * @values: if id is %GPIO_V2_LINE_ATTR_ID_OUTPUT_VALUES, a bitmap
++ * containing the values to which the lines will be set, with each bit
++ * number corresponding to the index into &struct
++ * gpio_v2_line_request.offsets
++ * @debounce_period_us: if id is %GPIO_V2_LINE_ATTR_ID_DEBOUNCE, the
++ * desired debounce period, in microseconds
++ */
++struct gpio_v2_line_attribute {
++	__u32 id;
++	__u32 padding;
++	union {
++		__aligned_u64 flags;
++		__aligned_u64 values;
++		__u32 debounce_period_us;
++	};
++};
++
++/**
++ * struct gpio_v2_line_config_attribute - a configuration attribute
++ * associated with one or more of the requested lines.
++ * @attr: the configurable attribute
++ * @mask: a bitmap identifying the lines to which the attribute applies,
++ * with each bit number corresponding to the index into &struct
++ * gpio_v2_line_request.offsets
++ */
++struct gpio_v2_line_config_attribute {
++	struct gpio_v2_line_attribute attr;
++	__aligned_u64 mask;
++};
++
++/**
++ * struct gpio_v2_line_config - Configuration for GPIO lines
++ * @flags: flags for the GPIO lines, with values from &enum
++ * gpio_v2_line_flag, such as %GPIO_V2_LINE_FLAG_ACTIVE_LOW,
++ * %GPIO_V2_LINE_FLAG_OUTPUT etc, added together.  This is the default for
++ * all requested lines but may be overridden for particular lines using
++ * @attrs.
++ * @num_attrs: the number of attributes in @attrs
++ * @padding: reserved for future use and must be zero filled
++ * @attrs: the configuration attributes associated with the requested
++ * lines.  Any attribute should only be associated with a particular line
++ * once.  If an attribute is associated with a line multiple times then the
++ * first occurrence (i.e. lowest index) has precedence.
++ */
++struct gpio_v2_line_config {
++	__aligned_u64 flags;
++	__u32 num_attrs;
++	/* Pad to fill implicit padding and reserve space for future use. */
++	__u32 padding[5];
++	struct gpio_v2_line_config_attribute attrs[GPIO_V2_LINE_NUM_ATTRS_MAX];
++};
++
++/**
++ * struct gpio_v2_line_request - Information about a request for GPIO lines
++ * @offsets: an array of desired lines, specified by offset index for the
++ * associated GPIO chip
++ * @consumer: a desired consumer label for the selected GPIO lines such as
++ * "my-bitbanged-relay"
++ * @config: requested configuration for the lines
++ * @num_lines: number of lines requested in this request, i.e. the number
++ * of valid fields in the %GPIO_V2_LINES_MAX sized arrays, set to 1 to
++ * request a single line
++ * @event_buffer_size: a suggested minimum number of line events that the
++ * kernel should buffer.  This is only relevant if edge detection is
++ * enabled in the configuration. Note that this is only a suggested value
++ * and the kernel may allocate a larger buffer or cap the size of the
++ * buffer. If this field is zero then the buffer size defaults to a minimum
++ * of @num_lines * 16.
++ * @padding: reserved for future use and must be zero filled
++ * @fd: after a successful %GPIO_V2_GET_LINE_IOCTL operation, contains
++ * a valid anonymous file descriptor representing the request
++ */
++struct gpio_v2_line_request {
++	__u32 offsets[GPIO_V2_LINES_MAX];
++	char consumer[GPIO_MAX_NAME_SIZE];
++	struct gpio_v2_line_config config;
++	__u32 num_lines;
++	__u32 event_buffer_size;
++	/* Pad to fill implicit padding and reserve space for future use. */
++	__u32 padding[5];
++	__s32 fd;
++};
++
++/**
++ * struct gpio_v2_line_info - Information about a certain GPIO line
++ * @name: the name of this GPIO line, such as the output pin of the line on
++ * the chip, a rail or a pin header name on a board, as specified by the
++ * GPIO chip, may be empty (i.e. name[0] == '\0')
++ * @consumer: a functional name for the consumer of this GPIO line as set
++ * by whatever is using it, will be empty if there is no current user but
++ * may also be empty if the consumer doesn't set this up
++ * @offset: the local offset on this GPIO chip, fill this in when
++ * requesting the line information from the kernel
++ * @num_attrs: the number of attributes in @attrs
++ * @flags: flags for this GPIO line, with values from &enum
++ * gpio_v2_line_flag, such as %GPIO_V2_LINE_FLAG_ACTIVE_LOW,
++ * %GPIO_V2_LINE_FLAG_OUTPUT etc, added together
++ * @attrs: the configuration attributes associated with the line
++ * @padding: reserved for future use
++ */
++struct gpio_v2_line_info {
++	char name[GPIO_MAX_NAME_SIZE];
++	char consumer[GPIO_MAX_NAME_SIZE];
++	__u32 offset;
++	__u32 num_attrs;
++	__aligned_u64 flags;
++	struct gpio_v2_line_attribute attrs[GPIO_V2_LINE_NUM_ATTRS_MAX];
++	/* Space reserved for future use. */
++	__u32 padding[4];
++};
++
++/**
++ * enum gpio_v2_line_changed_type - &struct gpio_v2_line_changed.event_type
++ * values
++ * @GPIO_V2_LINE_CHANGED_REQUESTED: line has been requested
++ * @GPIO_V2_LINE_CHANGED_RELEASED: line has been released
++ * @GPIO_V2_LINE_CHANGED_CONFIG: line has been reconfigured
++ */
++enum gpio_v2_line_changed_type {
++	GPIO_V2_LINE_CHANGED_REQUESTED	= 1,
++	GPIO_V2_LINE_CHANGED_RELEASED	= 2,
++	GPIO_V2_LINE_CHANGED_CONFIG	= 3,
++};
++
++/**
++ * struct gpio_v2_line_info_changed - Information about a change in status
++ * of a GPIO line
++ * @info: updated line information
++ * @timestamp_ns: estimate of time of status change occurrence, in nanoseconds
++ * @event_type: the type of change with a value from &enum
++ * gpio_v2_line_changed_type
++ * @padding: reserved for future use
++ */
++struct gpio_v2_line_info_changed {
++	struct gpio_v2_line_info info;
++	__aligned_u64 timestamp_ns;
++	__u32 event_type;
++	/* Pad struct to 64-bit boundary and reserve space for future use. */
++	__u32 padding[5];
++};
++
++/**
++ * enum gpio_v2_line_event_id - &struct gpio_v2_line_event.id values
++ * @GPIO_V2_LINE_EVENT_RISING_EDGE: event triggered by a rising edge
++ * @GPIO_V2_LINE_EVENT_FALLING_EDGE: event triggered by a falling edge
++ */
++enum gpio_v2_line_event_id {
++	GPIO_V2_LINE_EVENT_RISING_EDGE	= 1,
++	GPIO_V2_LINE_EVENT_FALLING_EDGE	= 2,
++};
++
++/**
++ * struct gpio_v2_line_event - The actual event being pushed to userspace
++ * @timestamp_ns: best estimate of time of event occurrence, in nanoseconds
++ * @id: event identifier with value from &enum gpio_v2_line_event_id
++ * @offset: the offset of the line that triggered the event
++ * @seqno: the sequence number for this event in the sequence of events for
++ * all the lines in this line request
++ * @line_seqno: the sequence number for this event in the sequence of
++ * events on this particular line
++ * @padding: reserved for future use
++ *
++ * By default the @timestamp_ns is read from %CLOCK_MONOTONIC and is
++ * intended to allow the accurate measurement of the time between events.
++ * It does not provide the wall-clock time.
++ *
++ * If the %GPIO_V2_LINE_FLAG_EVENT_CLOCK_REALTIME flag is set then the
++ * @timestamp_ns is read from %CLOCK_REALTIME.
++ *
++ * If the %GPIO_V2_LINE_FLAG_EVENT_CLOCK_HTE flag is set then the
++ * @timestamp_ns is provided by the hardware timestamping engine (HTE)
++ * subsystem.
++ */
++struct gpio_v2_line_event {
++	__aligned_u64 timestamp_ns;
++	__u32 id;
++	__u32 offset;
++	__u32 seqno;
++	__u32 line_seqno;
++	/* Space reserved for future use. */
++	__u32 padding[6];
++};
++
++/*
++ * ABI v1
++ *
++ * This version of the ABI is deprecated.
++ * Use the latest version of the ABI, defined above, instead.
++ */
++
++/* Informational flags */
++#define GPIOLINE_FLAG_KERNEL		(1UL << 0) /* Line used by the kernel */
++#define GPIOLINE_FLAG_IS_OUT		(1UL << 1)
++#define GPIOLINE_FLAG_ACTIVE_LOW	(1UL << 2)
++#define GPIOLINE_FLAG_OPEN_DRAIN	(1UL << 3)
++#define GPIOLINE_FLAG_OPEN_SOURCE	(1UL << 4)
++#define GPIOLINE_FLAG_BIAS_PULL_UP	(1UL << 5)
++#define GPIOLINE_FLAG_BIAS_PULL_DOWN	(1UL << 6)
++#define GPIOLINE_FLAG_BIAS_DISABLE	(1UL << 7)
++
++/**
++ * struct gpioline_info - Information about a certain GPIO line
++ * @line_offset: the local offset on this GPIO device, fill this in when
++ * requesting the line information from the kernel
++ * @flags: various flags for this line
++ * @name: the name of this GPIO line, such as the output pin of the line on the
++ * chip, a rail or a pin header name on a board, as specified by the gpio
++ * chip, may be empty (i.e. name[0] == '\0')
++ * @consumer: a functional name for the consumer of this GPIO line as set by
++ * whatever is using it, will be empty if there is no current user but may
++ * also be empty if the consumer doesn't set this up
++ *
++ * Note: This struct is part of ABI v1 and is deprecated.
++ * Use ABI v2 and &struct gpio_v2_line_info instead.
++ */
++struct gpioline_info {
++	__u32 line_offset;
++	__u32 flags;
++	char name[GPIO_MAX_NAME_SIZE];
++	char consumer[GPIO_MAX_NAME_SIZE];
++};
++
++/* Maximum number of requested handles */
++#define GPIOHANDLES_MAX 64
++
++/* Possible line status change events */
++enum {
++	GPIOLINE_CHANGED_REQUESTED = 1,
++	GPIOLINE_CHANGED_RELEASED,
++	GPIOLINE_CHANGED_CONFIG,
++};
++
++/**
++ * struct gpioline_info_changed - Information about a change in status
++ * of a GPIO line
++ * @info: updated line information
++ * @timestamp: estimate of time of status change occurrence, in nanoseconds
++ * @event_type: one of %GPIOLINE_CHANGED_REQUESTED,
++ * %GPIOLINE_CHANGED_RELEASED and %GPIOLINE_CHANGED_CONFIG
++ * @padding: reserved for future use
++ *
++ * The &struct gpioline_info embedded here has 32-bit alignment on its own,
++ * but it works fine with 64-bit alignment too. With its 72 byte size, we can
++ * guarantee there are no implicit holes between it and subsequent members.
++ * The 20-byte padding at the end makes sure we don't add any implicit padding
++ * at the end of the structure on 64-bit architectures.
++ *
++ * Note: This struct is part of ABI v1 and is deprecated.
++ * Use ABI v2 and &struct gpio_v2_line_info_changed instead.
++ */
++struct gpioline_info_changed {
++	struct gpioline_info info;
++	__u64 timestamp;
++	__u32 event_type;
++	__u32 padding[5]; /* for future use */
++};
++
++/* Linerequest flags */
++#define GPIOHANDLE_REQUEST_INPUT	(1UL << 0)
++#define GPIOHANDLE_REQUEST_OUTPUT	(1UL << 1)
++#define GPIOHANDLE_REQUEST_ACTIVE_LOW	(1UL << 2)
++#define GPIOHANDLE_REQUEST_OPEN_DRAIN	(1UL << 3)
++#define GPIOHANDLE_REQUEST_OPEN_SOURCE	(1UL << 4)
++#define GPIOHANDLE_REQUEST_BIAS_PULL_UP	(1UL << 5)
++#define GPIOHANDLE_REQUEST_BIAS_PULL_DOWN	(1UL << 6)
++#define GPIOHANDLE_REQUEST_BIAS_DISABLE	(1UL << 7)
++
++/**
++ * struct gpiohandle_request - Information about a GPIO handle request
++ * @lineoffsets: an array of desired lines, specified by offset index for the
++ * associated GPIO device
++ * @flags: desired flags for the desired GPIO lines, such as
++ * %GPIOHANDLE_REQUEST_OUTPUT, %GPIOHANDLE_REQUEST_ACTIVE_LOW etc, added
++ * together. Note that even if multiple lines are requested, the same flags
++ * must be applicable to all of them, if you want lines with individual
++ * flags set, request them one by one. It is possible to select
++ * a batch of input or output lines, but they must all have the same
++ * characteristics, i.e. all inputs or all outputs, all active low etc
++ * @default_values: if the %GPIOHANDLE_REQUEST_OUTPUT is set for a requested
++ * line, this specifies the default output value, should be 0 (inactive) or
++ * 1 (active).  Anything other than 0 or 1 will be interpreted as active.
++ * @consumer_label: a desired consumer label for the selected GPIO line(s)
++ * such as "my-bitbanged-relay"
++ * @lines: number of lines requested in this request, i.e. the number of
++ * valid fields in the above arrays, set to 1 to request a single line
++ * @fd: after a successful %GPIO_GET_LINEHANDLE_IOCTL operation, contains
++ * a valid anonymous file descriptor representing the request
++ *
++ * Note: This struct is part of ABI v1 and is deprecated.
++ * Use ABI v2 and &struct gpio_v2_line_request instead.
++ */
++struct gpiohandle_request {
++	__u32 lineoffsets[GPIOHANDLES_MAX];
++	__u32 flags;
++	__u8 default_values[GPIOHANDLES_MAX];
++	char consumer_label[GPIO_MAX_NAME_SIZE];
++	__u32 lines;
++	int fd;
++};
++
++/**
++ * struct gpiohandle_config - Configuration for a GPIO handle request
++ * @flags: updated flags for the requested GPIO lines, such as
++ * %GPIOHANDLE_REQUEST_OUTPUT, %GPIOHANDLE_REQUEST_ACTIVE_LOW etc, added
++ * together
++ * @default_values: if the %GPIOHANDLE_REQUEST_OUTPUT is set in flags,
++ * this specifies the default output value, should be 0 (inactive) or
++ * 1 (active).  Anything other than 0 or 1 will be interpreted as active.
++ * @padding: reserved for future use and should be zero filled
++ *
++ * Note: This struct is part of ABI v1 and is deprecated.
++ * Use ABI v2 and &struct gpio_v2_line_config instead.
++ */
++struct gpiohandle_config {
++	__u32 flags;
++	__u8 default_values[GPIOHANDLES_MAX];
++	__u32 padding[4]; /* padding for future use */
++};
++
++/**
++ * struct gpiohandle_data - Information of values on a GPIO handle
++ * @values: when getting the state of lines this contains the current
++ * state of a line, when setting the state of lines these should contain
++ * the desired target state.  States are 0 (inactive) or 1 (active).
++ * When setting, anything other than 0 or 1 will be interpreted as active.
++ *
++ * Note: This struct is part of ABI v1 and is deprecated.
++ * Use ABI v2 and &struct gpio_v2_line_values instead.
++ */
++struct gpiohandle_data {
++	__u8 values[GPIOHANDLES_MAX];
++};
++
++/* Eventrequest flags */
++#define GPIOEVENT_REQUEST_RISING_EDGE	(1UL << 0)
++#define GPIOEVENT_REQUEST_FALLING_EDGE	(1UL << 1)
++#define GPIOEVENT_REQUEST_BOTH_EDGES	((1UL << 0) | (1UL << 1))
++
++/**
++ * struct gpioevent_request - Information about a GPIO event request
++ * @lineoffset: the desired line to subscribe to events from, specified by
++ * offset index for the associated GPIO device
++ * @handleflags: desired handle flags for the desired GPIO line, such as
++ * %GPIOHANDLE_REQUEST_ACTIVE_LOW or %GPIOHANDLE_REQUEST_OPEN_DRAIN
++ * @eventflags: desired flags for the desired GPIO event line, such as
++ * %GPIOEVENT_REQUEST_RISING_EDGE or %GPIOEVENT_REQUEST_FALLING_EDGE
++ * @consumer_label: a desired consumer label for the selected GPIO line(s)
++ * such as "my-listener"
++ * @fd: after a successful %GPIO_GET_LINEEVENT_IOCTL operation, contains a
++ * valid anonymous file descriptor representing the request
++ *
++ * Note: This struct is part of ABI v1 and is deprecated.
++ * Use ABI v2 and &struct gpio_v2_line_request instead.
++ */
++struct gpioevent_request {
++	__u32 lineoffset;
++	__u32 handleflags;
++	__u32 eventflags;
++	char consumer_label[GPIO_MAX_NAME_SIZE];
++	int fd;
++};
++
++/*
++ * GPIO event types
++ */
++#define GPIOEVENT_EVENT_RISING_EDGE 0x01
++#define GPIOEVENT_EVENT_FALLING_EDGE 0x02
++
++/**
++ * struct gpioevent_data - The actual event being pushed to userspace
++ * @timestamp: best estimate of time of event occurrence, in nanoseconds
++ * @id: event identifier, one of %GPIOEVENT_EVENT_RISING_EDGE or
++ *  %GPIOEVENT_EVENT_FALLING_EDGE
++ *
++ * Note: This struct is part of ABI v1 and is deprecated.
++ * Use ABI v2 and &struct gpio_v2_line_event instead.
++ */
++struct gpioevent_data {
++	__u64 timestamp;
++	__u32 id;
++};
++
++/*
++ * v1 and v2 ioctl()s
++ */
++#define GPIO_GET_CHIPINFO_IOCTL _IOR(0xB4, 0x01, struct gpiochip_info)
++#define GPIO_GET_LINEINFO_UNWATCH_IOCTL _IOWR(0xB4, 0x0C, __u32)
++
++/*
++ * v2 ioctl()s
++ */
++#define GPIO_V2_GET_LINEINFO_IOCTL _IOWR(0xB4, 0x05, struct gpio_v2_line_info)
++#define GPIO_V2_GET_LINEINFO_WATCH_IOCTL _IOWR(0xB4, 0x06, struct gpio_v2_line_info)
++#define GPIO_V2_GET_LINE_IOCTL _IOWR(0xB4, 0x07, struct gpio_v2_line_request)
++#define GPIO_V2_LINE_SET_CONFIG_IOCTL _IOWR(0xB4, 0x0D, struct gpio_v2_line_config)
++#define GPIO_V2_LINE_GET_VALUES_IOCTL _IOWR(0xB4, 0x0E, struct gpio_v2_line_values)
++#define GPIO_V2_LINE_SET_VALUES_IOCTL _IOWR(0xB4, 0x0F, struct gpio_v2_line_values)
++
++/*
++ * v1 ioctl()s
++ *
++ * These ioctl()s are deprecated.  Use the v2 equivalent instead.
++ */
++#define GPIO_GET_LINEINFO_IOCTL _IOWR(0xB4, 0x02, struct gpioline_info)
++#define GPIO_GET_LINEHANDLE_IOCTL _IOWR(0xB4, 0x03, struct gpiohandle_request)
++#define GPIO_GET_LINEEVENT_IOCTL _IOWR(0xB4, 0x04, struct gpioevent_request)
++#define GPIOHANDLE_GET_LINE_VALUES_IOCTL _IOWR(0xB4, 0x08, struct gpiohandle_data)
++#define GPIOHANDLE_SET_LINE_VALUES_IOCTL _IOWR(0xB4, 0x09, struct gpiohandle_data)
++#define GPIOHANDLE_SET_CONFIG_IOCTL _IOWR(0xB4, 0x0A, struct gpiohandle_config)
++#define GPIO_GET_LINEINFO_WATCH_IOCTL _IOWR(0xB4, 0x0B, struct gpioline_info)
++
++#endif /* _UAPI_GPIO_H_ */
+--- /dev/null
++++ b/lib/shutter.c
+@@ -0,0 +1,180 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/* PiSight shutter: kernel GPIO edge events, no sampling thread or timer.
++ * gpio-uapi.h is an unmodified copy of the pinned Raspberry Pi kernel UAPI
++ * (cd231d4775b14f228606c09f219b48308f6ab3aa/include/uapi/linux/gpio.h).
++ * The ARM toolchain predates GPIO v2; this header adds no runtime dependency.
++ */
++#define _GNU_SOURCE
++#include <errno.h>
++#include <fcntl.h>
++#include "gpio-uapi.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#include "events.h"
++#include "shutter.h"
++#include "stream.h"
++
++struct shutter {
++	struct events *events;
++	struct uvc_stream *stream;
++	int fd;
++	int watching;
++	int closed;
++	char soft_connect[256];
++};
++
++static int shutter_usb(struct shutter *shutter, int closed)
++{
++	const char *command = closed ? "disconnect" : "connect";
++	int fd = open(shutter->soft_connect, O_WRONLY | O_CLOEXEC);
++	if (fd < 0)
++		return -1;
++	ssize_t count = write(fd, command, strlen(command));
++	int error = errno;
++	close(fd);
++	if (count != (ssize_t)strlen(command)) {
++		errno = count < 0 ? error : EIO;
++		return -1;
++	}
++	return 0;
++}
++
++static int shutter_apply(struct shutter *shutter)
++{
++	struct gpio_v2_line_values value = { .mask = 1 };
++	if (ioctl(shutter->fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &value) < 0)
++		return -1;
++	int closed = !!(value.bits & 1);
++	if (closed == shutter->closed)
++		return 0;
++	/* Block queued STREAMON before disconnecting; unblock only on success. */
++	uvc_stream_set_shutter_closed(shutter->stream, 1);
++	if (shutter_usb(shutter, closed) < 0)
++		return -1;
++	uvc_stream_set_shutter_closed(shutter->stream, closed);
++	shutter->closed = closed;
++	fprintf(stderr, "Shutter: %s, USB %s\n", closed ? "closed" : "open",
++		closed ? "disconnected" : "connected");
++	return 0;
++}
++
++static void shutter_fault(struct shutter *shutter)
++{
++	perror("Shutter control failed; stopping capture");
++	uvc_stream_set_shutter_closed(shutter->stream, 1);
++	if (shutter_usb(shutter, 1) < 0)
++		perror("Shutter USB disconnect failed");
++	/* Exiting closes the UVC handle, deactivating the composite gadget. */
++	events_stop(shutter->events);
++}
++
++static void shutter_event(void *data)
++{
++	struct shutter *shutter = data;
++	struct gpio_v2_line_event events[16];
++	ssize_t count = read(shutter->fd, events, sizeof events);
++	if (count < 0 && (errno == EINTR || errno == EAGAIN))
++		return;
++	if (count <= 0 || count % sizeof(events[0])) {
++		if (count >= 0)
++			errno = EIO;
++		shutter_fault(shutter);
++		return;
++	}
++	/* Read the current debounced level, not a potentially stale queued edge. */
++	if (shutter_apply(shutter) < 0)
++		shutter_fault(shutter);
++}
++
++struct shutter *shutter_create(struct events *events, const char *udc)
++{
++	struct gpiochip_info chip_info = {0};
++	struct gpio_v2_line_request request = {0};
++	struct shutter *shutter = calloc(1, sizeof *shutter);
++	if (!shutter)
++		return NULL;
++	shutter->events = events;
++	shutter->fd = -1;
++	shutter->closed = -1;
++	int length = snprintf(shutter->soft_connect, sizeof shutter->soft_connect,
++		"/sys/class/udc/%s/soft_connect", udc);
++	if (length < 0 || length >= (int)sizeof shutter->soft_connect) {
++		errno = ENAMETOOLONG;
++		goto fail;
++	}
++	int chip = open("/dev/gpiochip0", O_RDONLY | O_CLOEXEC);
++	if (chip < 0)
++		goto fail;
++	if (ioctl(chip, GPIO_GET_CHIPINFO_IOCTL, &chip_info) < 0) {
++		close(chip);
++		goto fail;
++	}
++	/* Do not silently use the same line offset on an unrelated GPIO chip. */
++	if (strcmp(chip_info.label, "pinctrl-bcm2835") || chip_info.lines <= 26) {
++		close(chip);
++		errno = ENODEV;
++		goto fail;
++	}
++	request.offsets[0] = 26;
++	request.num_lines = 1;
++	strcpy(request.consumer, "pisight-shutter");
++	request.config.flags = GPIO_V2_LINE_FLAG_INPUT |
++		GPIO_V2_LINE_FLAG_EDGE_RISING | GPIO_V2_LINE_FLAG_EDGE_FALLING;
++	request.config.num_attrs = 1;
++	request.config.attrs[0].mask = 1;
++	request.config.attrs[0].attr.id = GPIO_V2_LINE_ATTR_ID_DEBOUNCE;
++	request.config.attrs[0].attr.debounce_period_us = 50000;
++	int ret = ioctl(chip, GPIO_V2_GET_LINE_IOCTL, &request);
++	int error = errno;
++	close(chip);
++	if (ret < 0) {
++		errno = error;
++		goto fail;
++	}
++	shutter->fd = request.fd;
++	if (shutter->fd >= FD_SETSIZE) {
++		errno = EMFILE;
++		goto fail;
++	}
++	/* UVC is still deactivated: keep USB off until the watcher is ready. */
++	if (shutter_usb(shutter, 1) < 0)
++		goto fail;
++	return shutter;
++fail:
++	perror("Initialize shutter");
++	shutter_destroy(shutter);
++	return NULL;
++}
++
++int shutter_start(struct shutter *shutter, struct uvc_stream *stream)
++{
++	shutter->stream = stream;
++	if (shutter_apply(shutter) < 0) {
++		shutter_fault(shutter);
++		return -1;
++	}
++	events_watch_fd(shutter->events, shutter->fd, EVENT_READ, shutter_event, shutter);
++	/* events_watch_fd has no return code; catch a failed registration. */
++	if (!FD_ISSET(shutter->fd, &shutter->events->rfds)) {
++		errno = ENOMEM;
++		shutter_fault(shutter);
++		return -1;
++	}
++	shutter->watching = 1;
++	return 0;
++}
++
++void shutter_destroy(struct shutter *shutter)
++{
++	if (!shutter)
++		return;
++	if (shutter->watching)
++		events_unwatch_fd(shutter->events, shutter->fd, EVENT_READ);
++	if (shutter->fd >= 0)
++		close(shutter->fd);
++	free(shutter);
++}
+--- a/lib/stream.c
++++ b/lib/stream.c
+@@ -35,6 +35,7 @@
+ 	struct events *events;
+ 
+ 	int active;
++	int shutter_closed;
+ 	unsigned int logo_mode;
+ 
+ 	uvc_stream_gpio_cb_t gpio_cb;
+@@ -312,6 +313,12 @@
+ 
+ void uvc_stream_enable(struct uvc_stream *stream, int enable)
+ {
++	if (enable && stream->shutter_closed)
++		return;
++	enable = !!enable;
++	if (stream->active == enable)
++		return;
++
+ 	uvc_log("STREAM_ENABLE enable=%d\n", enable);
+ 
+ 	if (enable) {
+@@ -326,6 +333,13 @@
+ 	uvc_stream_update_leds(stream);
+ }
+ 
++void uvc_stream_set_shutter_closed(struct uvc_stream *stream, int closed)
++{
++	stream->shutter_closed = !!closed;
++	if (closed)
++		uvc_stream_enable(stream, 0);
++}
++
+ int uvc_stream_set_format(struct uvc_stream *stream,
+ 			  const struct v4l2_pix_format *format)
+ {
+--- a/lib/uvc.c
++++ b/lib/uvc.c
+@@ -687,6 +687,7 @@
+ 		uvc_log("EVENT_CONNECT\n");
+ 		return;
+ 	case UVC_EVENT_DISCONNECT:
++		uvc_stream_enable(dev->stream, 0);
+ 		pisight_diag_close(&dev->diagnostic);
+ 		uvc_log("EVENT_DISCONNECT\n");
+ 		return;
+--- a/src/main.c
++++ b/src/main.c
+@@ -16,6 +16,7 @@
+ #include "events.h"
+ #include "gpio.h"
+ #include "stream.h"
++#include "shutter.h"
+ #include "libcamera-source.h"
+ #include "v4l2-source.h"
+ #include "test-source.h"
+@@ -35,6 +36,7 @@
+ #ifdef HAVE_PIGPIO
+ 	fprintf(stderr, " -p pins	Space-separated pins for running and streaming LEDs\n");
+ #endif
++	fprintf(stderr, " -S\t\tPiSight GPIO 26 shutter soft disconnect\n");
+ 	fprintf(stderr, " -h		Print this help screen and exit\n");
+ 	fprintf(stderr, "\n");
+ 	fprintf(stderr, " <uvc device>	UVC device instance specifier\n");
+@@ -86,10 +88,12 @@
+ 	struct gpio_ctrl *gpio = NULL;
+ #endif
+ 	struct events events;
++	struct shutter *shutter = NULL;
++	int use_shutter = 0;
+ 	int ret = 0;
+ 	int opt;
+ 
+-	while ((opt = getopt(argc, argv, "c:d:i:s:p:k:h")) != -1) {
++	while ((opt = getopt(argc, argv, "c:d:i:s:p:k:hS")) != -1) {
+ 		switch (opt) {
+ #ifdef HAVE_LIBCAMERA
+ 		case 'c':
+@@ -112,6 +116,9 @@
+ 			pins = optarg;
+ 			break;
+ #endif
++		case 'S':
++			use_shutter = 1;
++			break;
+ 		case 'h':
+ 			usage(argv[0]);
+ 			return 0;
+@@ -147,6 +154,15 @@
+ 
+ 	sigint_events = &events;
+ 	signal(SIGINT, sigint_handler);
++	signal(SIGTERM, sigint_handler);
++
++	if (use_shutter) {
++		shutter = shutter_create(&events, fc->udc);
++		if (!shutter) {
++			ret = 1;
++			goto done;
++		}
++	}
+ 
+ 	/* Create and initialize a video source. */
+ 	if (cap_device)
+@@ -202,11 +218,19 @@
+ 	uvc_stream_set_video_source(stream, src);
+ 	uvc_stream_init_uvc(stream, fc);
+ 
++	if (shutter && shutter_start(shutter, stream) < 0) {
++		ret = 1;
++		goto done;
++	}
++
+ 	/* Main capture loop */
+ 	events_loop(&events);
+ 
+ done:
+ 	/* Cleanup */
++	shutter_destroy(shutter);
++	if (stream)
++		uvc_stream_enable(stream, 0);
+ 	uvc_stream_delete(stream);
+ 	video_source_destroy(src);
+ #ifdef HAVE_PIGPIO

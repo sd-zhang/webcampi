@@ -1,0 +1,19 @@
+From: PiSight development <pisight@local>
+Subject: [PATCH] Name the USB audio function iSight Microphone
+
+Set the audio function, control interface and microphone terminal labels before
+binding. Kernel patch0010 reuses function_name for both streaming alt settings.
+
+--- a/scripts/uvc-gadget.sh
++++ b/scripts/uvc-gadget.sh
+@@ -193,6 +193,10 @@
+ 	if [ "${ISIGHT_MICROPHONE:-on}" != off ]; then
+ 		echo "Creating UAC2 microphone..."
+ 		mkdir functions/uac2.0
++		# Keep the microphone name identical while idle and recording.
++		for name in function_name if_ctrl_name p_it_name p_it_ch_name p_ot_name p_fu_vol_name; do
++			printf %s "iSight Microphone" > "functions/uac2.0/$name"
++		done
+ 		echo 1 > functions/uac2.0/p_chmask
+ 		echo 48000 > functions/uac2.0/p_srate
+ 		echo 2 > functions/uac2.0/p_ssize

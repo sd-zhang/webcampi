@@ -1,0 +1,147 @@
+From: PiSight development <pisight@local>
+Subject: [PATCH] base: log: skip suppressed message construction and operands
+
+The default INFO threshold currently discards DEBUG messages only after
+formatting them, including prefixes and expensive stream operands. Check the
+category level before construction. Keep Fatal unconditional and retain
+namespace-qualified calls, Loggable prefixes, stream manipulators, and
+single-statement if/else use. Enabled messages retain the existing logger.
+Two static methods explicitly select the namespace logger: qualifying LOG alone
+now qualifies its guard, not its final backend expression. LOG has void type;
+its internal documentation reflects this statement-style, lazy contract.
+
+--- a/include/libcamera/base/log.h
++++ b/include/libcamera/base/log.h
+@@ -105,12 +105,30 @@
+ 		const char *fileName = __builtin_FILE(),
+ 		unsigned int line = __builtin_LINE());
+ 
++/* Avoid constructing messages, prefixes or stream operands below the level. */
++inline bool _logShouldSkip(const LogCategory *category, LogSeverity severity)
++{
++	if (severity == LogFatal)
++		return false;
++
++	return severity < (category ? *category : LogCategory::defaultCategory()).severity();
++}
++
++class LogMessageVoidify
++{
++public:
++	void operator&(std::ostream &) const {}
++};
++
+ #ifndef __DOXYGEN__
+ #define _LOG_CATEGORY(name) logCategory##name
+ 
+ #define _LOG1(severity) \
+-	_log(nullptr, Log##severity).stream()
++	_logShouldSkip(nullptr, Log##severity) ? static_cast<void>(0) : \
++	::libcamera::LogMessageVoidify() & _log(nullptr, Log##severity).stream()
+ #define _LOG2(category, severity) \
++	_logShouldSkip(&_LOG_CATEGORY(category)(), Log##severity) ? static_cast<void>(0) : \
++	::libcamera::LogMessageVoidify() & \
+ 	_log(&_LOG_CATEGORY(category)(), Log##severity).stream()
+ 
+ /*
+--- a/src/libcamera/base/log.cpp
++++ b/src/libcamera/base/log.cpp
+@@ -1014,10 +1014,11 @@
+  * \param[in] category Category (optional)
+  * \param[in] severity Severity
+  *
+- * Return an std::ostream reference to which a message can be logged using the
+- * iostream API. The \a category, if specified, sets the message category. When
+- * absent the default category is used. The  \a severity controls whether the
+- * message is printed or discarded, depending on the log level for the category.
++ * Log a message using the iostream insertion syntax as a statement. The
++ * expression has void type. The \a category, if specified, sets the message
++ * category; otherwise the default category is used. Messages below the category
++ * level skip construction and do not evaluate stream operands or object prefixes.
++ * Do not rely on side effects in stream operands.
+  *
+  * If the severity is set to Fatal, execution is aborted and the program
+  * terminates immediately after printing the message.
+--- a/src/libcamera/v4l2_device.cpp
++++ b/src/libcamera/v4l2_device.cpp
+@@ -1011,6 +1011,9 @@
+ template<typename T>
+ int V4L2Device::fromColorSpace(const std::optional<ColorSpace> &colorSpace, T &v4l2Format)
+ {
++	/* Static methods have no Loggable instance or object prefix. */
++	using libcamera::_log;
++
+ 	v4l2Format.colorspace = V4L2_COLORSPACE_DEFAULT;
+ 	v4l2Format.xfer_func = V4L2_XFER_FUNC_DEFAULT;
+ 	v4l2Format.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+@@ -1039,7 +1042,7 @@
+ 	if (itPrimaries != primariesToV4l2.end()) {
+ 		v4l2Format.colorspace = itPrimaries->second;
+ 	} else {
+-		libcamera::LOG(V4L2, Warning)
++		LOG(V4L2, Warning)
+ 			<< "Unrecognised primaries in "
+ 			<< ColorSpace::toString(colorSpace);
+ 		ret = -EINVAL;
+@@ -1049,7 +1052,7 @@
+ 	if (itTransfer != transferFunctionToV4l2.end()) {
+ 		v4l2Format.xfer_func = itTransfer->second;
+ 	} else {
+-		libcamera::LOG(V4L2, Warning)
++		LOG(V4L2, Warning)
+ 			<< "Unrecognised transfer function in "
+ 			<< ColorSpace::toString(colorSpace);
+ 		ret = -EINVAL;
+@@ -1059,7 +1062,7 @@
+ 	if (itYcbcrEncoding != ycbcrEncodingToV4l2.end()) {
+ 		v4l2Format.ycbcr_enc = itYcbcrEncoding->second;
+ 	} else {
+-		libcamera::LOG(V4L2, Warning)
++		LOG(V4L2, Warning)
+ 			<< "Unrecognised YCbCr encoding in "
+ 			<< ColorSpace::toString(colorSpace);
+ 		ret = -EINVAL;
+@@ -1069,7 +1072,7 @@
+ 	if (itRange != rangeToV4l2.end()) {
+ 		v4l2Format.quantization = itRange->second;
+ 	} else {
+-		libcamera::LOG(V4L2, Warning)
++		LOG(V4L2, Warning)
+ 			<< "Unrecognised quantization in "
+ 			<< ColorSpace::toString(colorSpace);
+ 		ret = -EINVAL;
+--- a/src/libcamera/sensor/camera_sensor_raw.cpp
++++ b/src/libcamera/sensor/camera_sensor_raw.cpp
+@@ -171,10 +171,13 @@
+ std::variant<std::unique_ptr<CameraSensor>, int>
+ CameraSensorRaw::match(MediaEntity *entity)
+ {
++	/* Static methods have no Loggable instance or object prefix. */
++	using libcamera::_log;
++
+ 	/* Check the entity type. */
+ 	if (entity->type() != MediaEntity::Type::V4L2Subdevice ||
+ 	    entity->function() != MEDIA_ENT_F_CAM_SENSOR) {
+-		libcamera::LOG(CameraSensor, Debug)
++		LOG(CameraSensor, Debug)
+ 			<< entity->name() << ": unsupported entity type ("
+ 			<< utils::to_underlying(entity->type())
+ 			<< ") or function (" << utils::hex(entity->function()) << ")";
+@@ -199,7 +202,7 @@
+ 			break;
+ 
+ 		default:
+-			libcamera::LOG(CameraSensor, Debug)
++			LOG(CameraSensor, Debug)
+ 				<< entity->name() << ": unsupported pad " << pad->index()
+ 				<< " type " << utils::hex(pad->flags());
+ 			return { 0 };
+@@ -207,7 +210,7 @@
+ 	}
+ 
+ 	if (numSinks < 1 || numSinks > 2 || numSources != 1) {
+-		libcamera::LOG(CameraSensor, Debug)
++		LOG(CameraSensor, Debug)
+ 			<< entity->name() << ": unsupported number of sinks ("
+ 			<< numSinks << ") or sources (" << numSources << ")";
+ 		return { 0 };

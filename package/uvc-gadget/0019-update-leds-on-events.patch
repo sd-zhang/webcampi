@@ -1,0 +1,119 @@
+From: PiSight maintainers <pisight@localhost>
+Subject: [PATCH] Drive logo LEDs from stream and settings events
+
+Replace the boot shell poller with writes on initialization, stream changes,
+and persisted logo setting changes. Preserve off/on/activity modes without
+periodic GPIO reads or child processes.
+
+--- a/include/uvcgadget/stream.h
++++ b/include/uvcgadget/stream.h
+@@ -118,6 +118,9 @@
+  */
+ void uvc_stream_enable(struct uvc_stream *stream, int enable);
+ 
++/* Logo modes match the settings protocol: 0=off, 1=on, 2=activity. */
++void uvc_stream_set_logo_mode(struct uvc_stream *stream, unsigned int mode);
++
+ void uvc_stream_set_gpio_callback(struct uvc_stream *stream, uvc_stream_gpio_cb_t cb, void *ud);
+ 
+ #endif /* __STREAM_H__ */
+--- a/lib/gpio.c
++++ b/lib/gpio.c
+@@ -69,7 +69,9 @@
+         }
+     }
+ 
+-    if (gpio_set_pin_state(gpio, RUNNING, HIGH))
++    /* The stream callback applies the configured logo mode after init. */
++    if (gpio_set_pin_state(gpio, RUNNING, LOW) ||
++        gpio_set_pin_state(gpio, STREAMING, LOW))
+         return 1;
+ 
+     return 0;
+--- a/lib/stream.c
++++ b/lib/stream.c
+@@ -35,6 +35,7 @@
+ 	struct events *events;
+ 
+ 	int active;
++	unsigned int logo_mode;
+ 
+ 	uvc_stream_gpio_cb_t gpio_cb;
+ 	void *gpio_ud;
+@@ -292,6 +293,23 @@
+ 	return 0;
+ }
+ 
++/* LED writes happen only at initialization and stream/settings events. */
++static void uvc_stream_update_leds(struct uvc_stream *stream)
++{
++	if (!stream->gpio_cb)
++		return;
++
++	stream->gpio_cb(stream->gpio_ud, STREAMING, !!stream->active);
++	stream->gpio_cb(stream->gpio_ud, RUNNING,
++		stream->logo_mode == 1 || (stream->logo_mode == 2 && stream->active));
++}
++
++void uvc_stream_set_logo_mode(struct uvc_stream *stream, unsigned int mode)
++{
++	stream->logo_mode = mode;
++	uvc_stream_update_leds(stream);
++}
++
+ void uvc_stream_enable(struct uvc_stream *stream, int enable)
+ {
+ 	uvc_log("STREAM_ENABLE enable=%d\n", enable);
+@@ -305,8 +323,7 @@
+ 
+ 	stream->active = enable;
+ 
+-	if (stream->gpio_cb)
+-		stream->gpio_cb(stream->gpio_ud, STREAMING, enable);
++	uvc_stream_update_leds(stream);
+ }
+ 
+ int uvc_stream_set_format(struct uvc_stream *stream,
+@@ -340,6 +357,7 @@
+ {
+ 	stream->gpio_cb = cb;
+ 	stream->gpio_ud = ud;
++	uvc_stream_update_leds(stream);
+ }
+ 
+ /* ---------------------------------------------------------------------------
+--- a/lib/uvc.c
++++ b/lib/uvc.c
+@@ -162,6 +162,7 @@
+ 		if (!strcmp(logo, "off")) dev->logo_mode = 0;
+ 		else if (!strcmp(logo, "on")) dev->logo_mode = 1;
+ 	}
++	uvc_stream_set_logo_mode(stream, dev->logo_mode);
+ 	const char *microphone = getenv("ISIGHT_MICROPHONE");
+ 	if (microphone && !strcmp(microphone, "off")) dev->microphone = 0;
+ 
+@@ -563,6 +564,7 @@
+ 					dev->fov = fov;
+ 					dev->saved_ev = ev;
+ 					dev->logo_mode = logo;
++					uvc_stream_set_logo_mode(dev->stream, logo);
+ 					dev->microphone = microphone;
+ 					if (!uvc_stream_set_control(dev->stream, VIDEO_SOURCE_CTRL_ZOOM, zoom))
+ 						dev->zoom = zoom;
+--- a/src/main.c
++++ b/src/main.c
+@@ -189,12 +189,12 @@
+ 			goto done;
+ 		}
+ 
+-		uvc_stream_set_gpio_callback(stream, gpio_set_pin_state, gpio);
+-
+ 		if (gpio_init(gpio)) {
+ 			ret = 1;
+ 			goto done;
+ 		}
++
++		uvc_stream_set_gpio_callback(stream, gpio_set_pin_state, gpio);
+ 	}
+ #endif
+ 

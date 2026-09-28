@@ -1,0 +1,92 @@
+usb: gadget: u_audio: restore rate activity after UAC2 resume
+
+Suspend reports rate zero to stop the PiSight microphone bridge, but the
+UAC2 function previously had no resume callback. If the host resumes the
+same alternate setting, the endpoint requests remain queued while ALSA
+continues to report zero indefinitely. Restore activity from enabled
+endpoint state and notify subscribers without starting endpoints again.
+Mark endpoint state enabled only after usb_ep_enable succeeds.
+
+Signed-off-by: PiSight <pisight@localhost>
+
+--- a/drivers/usb/gadget/function/u_audio.h
++++ b/drivers/usb/gadget/function/u_audio.h
+@@ -131,5 +131,6 @@
+ int u_audio_set_mute(struct g_audio *g_audio, int playback, int val);
+ 
+ void u_audio_suspend(struct g_audio *g_audio);
++void u_audio_resume(struct g_audio *g_audio);
+ 
+ #endif /* __U_AUDIO_H */
+--- a/drivers/usb/gadget/function/u_audio.c
++++ b/drivers/usb/gadget/function/u_audio.c
+@@ -605,12 +605,12 @@
+ 
+ 	req_len = ep->maxpacket;
+ 
+-	prm->ep_enabled = true;
+ 	ret = usb_ep_enable(ep);
+ 	if (ret < 0) {
+ 		dev_err(dev, "usb_ep_enable failed for out_ep (%d)\n", ret);
+ 		return ret;
+ 	}
++	prm->ep_enabled = true;
+ 
+ 	for (i = 0; i < params->req_number; i++) {
+ 		if (!prm->reqs[i]) {
+@@ -741,12 +741,12 @@
+ 	req_len = p_pktsize;
+ 	uac->p_residue_mil = 0;
+ 
+-	prm->ep_enabled = true;
+ 	ret = usb_ep_enable(ep);
+ 	if (ret < 0) {
+ 		dev_err(dev, "usb_ep_enable failed for in_ep (%d)\n", ret);
+ 		return ret;
+ 	}
++	prm->ep_enabled = true;
+ 
+ 	for (i = 0; i < params->req_number; i++) {
+ 		if (!prm->reqs[i]) {
+@@ -790,6 +790,16 @@
+ 	set_active(&uac->c_prm, false);
+ }
+ EXPORT_SYMBOL_GPL(u_audio_suspend);
++
++/* Suspend hides the rate from userspace but leaves active USB requests alone. */
++void u_audio_resume(struct g_audio *audio_dev)
++{
++	struct snd_uac_chip *uac = audio_dev->uac;
++
++	set_active(&uac->p_prm, uac->p_prm.ep_enabled);
++	set_active(&uac->c_prm, uac->c_prm.ep_enabled);
++}
++EXPORT_SYMBOL_GPL(u_audio_resume);
+ 
+ int u_audio_get_volume(struct g_audio *audio_dev, int playback, s16 *val)
+ {
+--- a/drivers/usb/gadget/function/f_uac2.c
++++ b/drivers/usb/gadget/function/f_uac2.c
+@@ -1520,6 +1520,14 @@
+ 	u_audio_suspend(&uac2->g_audio);
+ }
+ 
++static void
++afunc_resume(struct usb_function *fn)
++{
++	struct f_uac2 *uac2 = func_to_uac2(fn);
++
++	u_audio_resume(&uac2->g_audio);
++}
++
+ static int
+ in_rq_cur(struct usb_function *fn, const struct usb_ctrlrequest *cr)
+ {
+@@ -2294,6 +2302,7 @@
+ 	uac2->g_audio.func.get_alt = afunc_get_alt;
+ 	uac2->g_audio.func.disable = afunc_disable;
+ 	uac2->g_audio.func.suspend = afunc_suspend;
++	uac2->g_audio.func.resume = afunc_resume;
+ 	uac2->g_audio.func.setup = afunc_setup;
+ 	uac2->g_audio.func.free_func = afunc_free;
+ 

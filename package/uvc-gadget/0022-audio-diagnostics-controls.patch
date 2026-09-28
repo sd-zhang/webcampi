@@ -1,0 +1,116 @@
+UVC: live audio tuning and opt-in diagnostics controls
+
+--- a/lib/uvc.c
++++ b/lib/uvc.c
+@@ -26,6 +26,7 @@
+ #include "tools.h"
+ #include "uvc-debug.h"
+ #include "pisight-diagnostic.h"
++#include "pisight-controls.h"
+ #include "uvc.h"
+ #include "v4l2.h"
+ #include "video-source.h"
+@@ -66,6 +67,7 @@
+ 	uint8_t logo_mode;
+ 	uint8_t microphone;
+ 	struct pisight_diagnostic diagnostic;
++	struct pisight_controls settings;
+ 
+ 	unsigned int fcc;
+ 	unsigned int width;
+@@ -172,11 +174,13 @@
+ 		return NULL;
+ 	}
+ 
++	pisight_controls_init(&dev->settings);
+ 	return dev;
+ }
+ 
+ void uvc_close(struct uvc_device *dev)
+ {
++	pisight_controls_close(&dev->settings);
+ 	pisight_diag_close(&dev->diagnostic);
+ 	v4l2_close(dev->vdev);
+ 	dev->vdev = NULL;
+@@ -264,6 +268,19 @@
+ 	int maximum;
+ 	int resolution;
+ 
++	if (dev->xu_unit && entity == dev->xu_unit && (cs == 3 || cs == 4)) {
++		if (req == UVC_SET_CUR && len == 32) {
++			dev->control_entity = entity; dev->control = cs; resp->length = 32;
++		} else if (req == UVC_GET_LEN && len == 2) {
++			resp->data[0] = 32; resp->data[1] = 0; resp->length = 2;
++		} else if (req == UVC_GET_INFO && len == 1) {
++			resp->data[0] = 3; resp->length = 1;
++		} else if (req == UVC_GET_CUR && len && len <= 32) {
++			pisight_controls_read(&dev->settings, cs - 3, resp->data);
++			resp->length = len;
++		}
++		return;
++	}
+ 	if (dev->xu_unit && entity == dev->xu_unit && cs == 2) {
+ 		if (req == UVC_SET_CUR && len == 60) {
+ 			dev->control_entity = entity;
+@@ -460,7 +477,7 @@
+ {
+ 	return dev->xu_unit && ctrl->wIndex >> 8 == dev->xu_unit &&
+ 		(ctrl->wIndex & 0xff) == UVC_STRING_CONTROL_IDX &&
+-		ctrl->wValue == 0x0200 &&
++		(ctrl->wValue == 0x0200 || ctrl->wValue == 0x0300 || ctrl->wValue == 0x0400) &&
+ 		(ctrl->bRequestType == 0xa1 || ctrl->bRequestType == 0x21);
+ }
+ 
+@@ -473,14 +490,14 @@
+ 	dev->control_entity = 0;
+ 
+ 	if (dev->xu_unit && ctrl->wIndex >> 8 == dev->xu_unit &&
+-	    ctrl->wValue >> 8 == 2) {
++	    (ctrl->wValue >> 8 >= 2 && ctrl->wValue >> 8 <= 4)) {
+ 		if (!uvc_is_diagnostic(dev, ctrl))
+ 			return;
+ 		/* Reject direction/request mismatches before arming a data stage. */
+ 		if ((ctrl->bRequest == UVC_SET_CUR) != (ctrl->bRequestType == 0x21))
+ 			return;
+ 		uvc_events_process_control(dev, ctrl->bRequest, dev->xu_unit,
+-					   2, ctrl->wLength, resp);
++					   ctrl->wValue >> 8, ctrl->wLength, resp);
+ 		return;
+ 	}
+ 
+@@ -537,6 +554,11 @@
+ uvc_events_process_data(struct uvc_device *dev,
+ 			const struct uvc_request_data *data)
+ {
++	if (dev->xu_unit && dev->control_entity == dev->xu_unit && (dev->control == 3 || dev->control == 4)) {
++		pisight_controls_command(&dev->settings, dev->control - 3, data->data, data->length);
++		dev->control_entity = 0; dev->control = 0;
++		return;
++	}
+ 	if (dev->xu_unit && dev->control_entity == dev->xu_unit && dev->control == 2) {
+ 		static const char *const paths[2] = {
+ 			"/tmp/PISIGHT.TXT",
+@@ -699,7 +721,7 @@
+ 		break;
+ 
+ 	case UVC_EVENT_DATA:
+-		if (!(dev->xu_unit && dev->control_entity == dev->xu_unit && dev->control == 2))
++		if (!(dev->xu_unit && dev->control_entity == dev->xu_unit && dev->control >= 2 && dev->control <= 4))
+ 			uvc_log("EVENT_DATA\n");
+ 		uvc_events_process_data(dev, &uvc_event->data);
+ 		return;
+--- a/scripts/uvc-gadget.sh
++++ b/scripts/uvc-gadget.sh
+@@ -112,9 +112,9 @@
+ 		# Set this XU as the source for the default output terminal
+ 		cat bUnitID > ../../terminal/output/default/bSourceID
+ 
+-		# Selectors 1: settings; 2: diagnostic snapshot readback.
+-		echo 2 > bNumControls
+-		echo 0x03 > bmControls
++		# Selectors: 1 camera settings, 2 snapshots, 3 audio, 4 diagnostics.
++		echo 4 > bNumControls
++		echo 0x0f > bmControls
+ 
+ 		# Stable 16-byte GUID, also used by the host configurator.
+ 		printf 'PiSightSettings1' > guidExtensionCode

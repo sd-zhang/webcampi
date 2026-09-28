@@ -1,0 +1,99 @@
+Subject: [PATCH] Submit camera crop and EV only when changed; retry cancelled requests
+
+--- a/lib/libcamera-source.cpp
++++ b/lib/libcamera-source.cpp
+@@ -51,6 +51,8 @@
+ 	Rectangle default_crop;
+ 	unsigned int zoom = 100; /* UVC Zoom Absolute, 100 = 1x */
+ 	int ev_tenths = 0;
++	/* Values belong to the event loop; cancellation callbacks only mark dirty. */
++	std::atomic<bool> controls_pending{true};
+ 
+ 	FrameBufferAllocator *allocator;
+ 	std::vector<std::unique_ptr<Request>> requests;
+@@ -114,8 +116,14 @@
+ 
+ void libcamera_source::requestComplete(Request *request)
+ {
+-	if (stopping || request->status() == Request::RequestCancelled)
++	if (stopping)
+ 		return;
++	if (request->status() == Request::RequestCancelled) {
++		/* queueRequest() can succeed before asynchronous device queue failure.
++		 * Retry the latest settings on the next surviving request. */
++		controls_pending = true;
++		return;
++	}
+ 
+ 	std::lock_guard<std::mutex> lock(completion_mutex);
+ 	completed_requests.push(request);
+@@ -340,18 +348,37 @@
+ 	case VIDEO_SOURCE_CTRL_ZOOM:
+ 		if (value < 100 || value > 350)
+ 			return -ERANGE;
++		if (src->zoom == (unsigned int)value)
++			return 0;
+ 		src->zoom = value;
+ 		break;
+ 	case VIDEO_SOURCE_CTRL_EV:
+ 		if (value < -20 || value > 20)
+ 			return -ERANGE;
++		if (src->ev_tenths == value)
++			return 0;
+ 		src->ev_tenths = value;
+ 		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+ 	libcamera_source_apply_controls(src, src->controls);
+-	return 0;
++	src->controls_pending = true;
++	return 0;
++}
++
++/* Queue controls once in submission order. Libcamera retains omitted settings.
++ * A failed queue must leave the update pending for a subsequent request. */
++static int libcamera_source_queue_request(struct libcamera_source *src, Request *request)
++{
++	/* Consume before queueing so a concurrent cancellation cannot be erased. */
++	bool pending = src->controls_pending.exchange(false);
++	if (pending)
++		libcamera_source_apply_controls(src, request->controls());
++	int ret = src->camera->queueRequest(request);
++	if (ret && pending)
++		src->controls_pending = true;
++	return ret;
+ }
+ 
+ static int libcamera_source_alloc_buffers(struct video_source *s, unsigned int nbufs)
+@@ -496,6 +523,8 @@
+ 	src->pipe_error_logged = false;
+ 	src->stopping = false;
+ 	src->encoded_frames = src->dropped_frames = 0;
++	/* Each new stream must submit the current crop and EV at least once. */
++	src->controls_pending = true;
+ 	ret = src->camera->start(&src->controls);
+ 	if (ret) {
+ 		std::cerr << "failed to start camera" << std::endl;
+@@ -503,8 +532,7 @@
+ 	}
+ 
+ 	for (std::unique_ptr<Request> &request : src->requests) {
+-		libcamera_source_apply_controls(src, request->controls());
+-		ret = src->camera->queueRequest(request.get());
++		ret = libcamera_source_queue_request(src, request.get());
+ 		if (ret) {
+ 			std::cerr << "failed to queue request" << std::endl;
+ 			src->camera->stop();
+@@ -570,10 +598,7 @@
+ 	for (std::unique_ptr<Request> &r : src->requests) {
+ 		if (r->cookie() == buf->index) {
+ 			r->reuse(Request::ReuseBuffers);
+-			libcamera_source_apply_controls(src, r->controls());
+-			src->camera->queueRequest(r.get());
+-
+-			break;
++			return libcamera_source_queue_request(src, r.get());
+ 		}
+ 	}
+ 

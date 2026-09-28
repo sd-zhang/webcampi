@@ -1,0 +1,23 @@
+usb: gadget: uvc: handle dwc2 missed isochronous transfers
+
+dwc2_gadget_handle_nak() completes elapsed isochronous IN requests with
+-ENODATA. The PiSight target reports this during UVC startup and streaming.
+UVC currently falls through to the fatal-error case and cancels the whole
+video buffer queue, including when the missed request has zero length.
+
+Treat -ENODATA like -EXDEV, the existing missed-transfer case. Empty idle
+requests should not discard video; a missed payload uses the existing
+incomplete-frame recovery. Shutdown and other errors retain their behavior.
+
+Signed-off-by: PiSight <pisight@localhost>
+
+--- a/drivers/usb/gadget/function/uvc_video.c
++++ b/drivers/usb/gadget/function/uvc_video.c
+@@ -399,6 +399,7 @@
+ 		break;
+ 
+ 	case -EXDEV:
++	case -ENODATA: /* dwc2: missed isochronous frame */
+ 		uvcg_dbg(&video->uvc->func, "VS request missed xfer.\n");
+ 		if (req->length != 0)
+ 			queue->flags |= UVC_QUEUE_DROP_INCOMPLETE;

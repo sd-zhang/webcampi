@@ -1,0 +1,116 @@
+#!/bin/sh
+# Opt-in, bounded RAM snapshots, downloadable through existing UVC readback.
+
+LOG=/tmp/PISIGHT.TXT
+BOOT=/boot
+CARD=/dev/mmcblk0p1
+MIC_LOG=/tmp/pisight-mic.log
+MIC_LOG_BYTES=0
+
+microphone_log() {
+	[ -r "$MIC_LOG" ] || return
+	size=$(wc -c < "$MIC_LOG")
+	[ "$size" -ge "$MIC_LOG_BYTES" ] || MIC_LOG_BYTES=0
+	if [ "$size" -gt "$MIC_LOG_BYTES" ]; then
+		tail -c "+$((MIC_LOG_BYTES + 1))" "$MIC_LOG" |
+			head -c "$((size - MIC_LOG_BYTES))"
+	fi
+	MIC_LOG_BYTES=$size
+}
+
+# Snapshot readback uses UVC. No automatic writes to the boot partition.
+enabled() {
+    state=0
+    IFS= read -r state 2>/dev/null < /run/pisight-diagnostics || return 1
+    [ "$state" = 1 ]
+}
+
+snapshot() {
+	enabled || return 0
+	{
+		printf '\n===== %s at uptime %s =====\n' "$1" "$(cat /proc/uptime 2>/dev/null)"
+		printf '\n--- boot mount and config ---\n'
+		grep ' /boot ' /proc/mounts || true
+		ls -l "$CARD" 2>&1
+		cat "$BOOT/isight.json" 2>&1
+		printf '\n--- applied environment ---\n'
+		cat /run/isight.env 2>&1
+		printf '\n--- gadget functions ---\n'
+		ls -l /sys/kernel/config/usb_gadget/g1/configs/c.1 2>&1
+		printf '\n--- ALSA cards and PCM state ---\n'
+		cat /proc/asound/cards 2>&1
+		for file in /proc/asound/card*/pcm*/sub*/status /proc/asound/card*/pcm*/sub*/hw_params; do
+			[ -f "$file" ] || continue
+			printf '%s\n' "$file"
+			cat "$file"
+		done
+		printf '\n--- processes ---\n'
+		ps 2>&1
+		printf '\n--- CPU, interrupts, and thread accounting ---\n'
+		cat /proc/stat /proc/interrupts /proc/loadavg /proc/meminfo 2>&1
+		for proc in /proc/[0-9]*; do
+			[ -r "$proc/comm" ] || continue
+			case "$(cat "$proc/comm" 2>/dev/null)" in
+				alsaloop|pisight-mic|uvc-gadget|pigpiod)
+					for file in "$proc"/task/*/stat "$proc"/task/*/schedstat; do
+						[ -r "$file" ] || continue
+						printf '%s\n' "$file"
+						cat "$file"
+					done
+					;;
+			esac
+		 done
+		printf '\n--- microphone bridge ---\n'
+		microphone_log
+		printf '\n--- USB recovery counters (cumulative since boot) ---\n'
+		for file in /sys/kernel/debug/usb/*/isoc_stats /sys/kernel/debug/usb/*/params; do
+			[ -r "$file" ] || continue
+			printf '%s\n' "$file"
+			cat "$file"
+		done
+		printf '\n--- CPU frequency ---\n'
+		for file in /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor; do
+			[ -r "$file" ] || continue
+			printf '%s\n' "$file"
+			cat "$file"
+		done
+		printf '\n--- raw I2S capture ---\n'
+		cat /tmp/pisight-i2s-capture.log 2>&1
+		printf '\n--- config apply and gadget setup ---\n'
+		tail -n 100 /tmp/isight-config-apply.log /tmp/uvc-setup.log 2>&1
+		printf '\n--- UVC daemon ---\n'
+		tail -n 100 /tmp/uvc-gadget.log 2>&1
+		printf '\n--- UVC events ---\n'
+		tail -n 100 /tmp/uvc-events.log 2>&1
+		printf '\n--- kernel ---\n'
+		dmesg 2>&1 | tail -n 100
+	} > "$LOG.next"
+    # A disable arriving during collection prevents publishing this snapshot.
+    enabled || { rm -f "$LOG.next"; return 0; }
+    bytes=0
+    [ ! -f "$LOG" ] || bytes=$(wc -c < "$LOG")
+    [ "$bytes" -le 3932160 ] || : > "$LOG"
+    head -c 262144 "$LOG.next" >> "$LOG"
+    rm -f "$LOG.next"
+}
+
+case "$1" in
+	start)
+		(
+			umask 022
+			mkdir -p /sys/kernel/debug
+			grep -q ' /sys/kernel/debug ' /proc/mounts ||
+				mount -t debugfs none /sys/kernel/debug
+			sleep 2
+			snapshot boot
+			elapsed=0
+			while :; do
+				sleep 60
+				elapsed=$((elapsed + 60))
+				snapshot "periodic_${elapsed}s"
+			done
+		) </dev/null >/tmp/pisight-diagnostic.log 2>&1 &
+		;;
+	stop) ;;
+	*) exit 1 ;;
+esac

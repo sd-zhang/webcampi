@@ -1,0 +1,81 @@
+Subject: [PATCH] Cache VC4 lens-shading sampling geometry without changing gains
+
+--- a/src/ipa/rpi/vc4/vc4.cpp
++++ b/src/ipa/rpi/vc4/vc4.cpp
+@@ -74,6 +74,13 @@
+ 	void applyLS(const struct AlscStatus *lsStatus, ControlList &ctrls);
+ 	void applyAF(const struct AfStatus *afStatus, ControlList &lensCtrls);
+ 	void resampleTable(uint16_t dest[], const std::vector<double> &src, int destW, int destH);
++
++	/* Sampling geometry depends only on the destination grid, not its gains. */
++	struct LsSampling {
++		int width = 0, height = 0;
++		int xLo[64], xHi[64], yLo[49], yHi[49];
++		double xf[64], yf[49];
++	} lsSampling_;
+ 
+ 	/* VC4 ISP controls. */
+ 	ControlInfoMap ispCtrls_;
+@@ -541,33 +548,36 @@
+ void IpaVc4::resampleTable(uint16_t dest[], const std::vector<double> &src,
+ 			   int destW, int destH)
+ {
+-	/*
+-	 * Precalculate and cache the x sampling locations and phases to
+-	 * save recomputing them on every row.
+-	 */
+-	assert(destW > 1 && destH > 1 && destW <= 64);
+-	int xLo[64], xHi[64];
+-	double xf[64];
+-	double x = -0.5, xInc = 16.0 / (destW - 1);
+-	for (int i = 0; i < destW; i++, x += xInc) {
+-		xLo[i] = floor(x);
+-		xf[i] = x - xLo[i];
+-		xHi[i] = xLo[i] < 15 ? xLo[i] + 1 : 15;
+-		xLo[i] = xLo[i] > 0 ? xLo[i] : 0;
+-	}
+-
+-	/* Now march over the output table generating the new values. */
+-	double y = -0.5, yInc = 12.0 / (destH - 1);
+-	for (int j = 0; j < destH; j++, y += yInc) {
+-		int yLo = floor(y);
+-		double yf = y - yLo;
+-		int yHi = yLo < 11 ? yLo + 1 : 11;
+-		yLo = yLo > 0 ? yLo : 0;
+-		double const *rowAbove = src.data() + yLo * 16;
+-		double const *rowBelow = src.data() + yHi * 16;
++	assert(destW > 1 && destH > 1 && destW <= 64 && destH <= 49);
++	auto &g = lsSampling_;
++	if (g.width != destW || g.height != destH) {
++		/* Preserve the original accumulation and rounding order exactly. */
++		double x = -0.5, xInc = 16.0 / (destW - 1);
++		for (int i = 0; i < destW; i++, x += xInc) {
++			g.xLo[i] = floor(x);
++			g.xf[i] = x - g.xLo[i];
++			g.xHi[i] = g.xLo[i] < 15 ? g.xLo[i] + 1 : 15;
++			g.xLo[i] = g.xLo[i] > 0 ? g.xLo[i] : 0;
++		}
++		double y = -0.5, yInc = 12.0 / (destH - 1);
++		for (int j = 0; j < destH; j++, y += yInc) {
++			g.yLo[j] = floor(y);
++			g.yf[j] = y - g.yLo[j];
++			g.yHi[j] = g.yLo[j] < 11 ? g.yLo[j] + 1 : 11;
++			g.yLo[j] = g.yLo[j] > 0 ? g.yLo[j] : 0;
++		}
++		g.width = destW;
++		g.height = destH;
++	}
++
++	/* Recompute every output gain; only coordinates are cached. */
++	for (int j = 0; j < destH; j++) {
++		double yf = g.yf[j];
++		double const *rowAbove = src.data() + g.yLo[j] * 16;
++		double const *rowBelow = src.data() + g.yHi[j] * 16;
+ 		for (int i = 0; i < destW; i++) {
+-			double above = rowAbove[xLo[i]] * (1 - xf[i]) + rowAbove[xHi[i]] * xf[i];
+-			double below = rowBelow[xLo[i]] * (1 - xf[i]) + rowBelow[xHi[i]] * xf[i];
++			double above = rowAbove[g.xLo[i]] * (1 - g.xf[i]) + rowAbove[g.xHi[i]] * g.xf[i];
++			double below = rowBelow[g.xLo[i]] * (1 - g.xf[i]) + rowBelow[g.xHi[i]] * g.xf[i];
+ 			int result = floor(1024 * (above * (1 - yf) + below * yf) + .5);
+ 			*(dest++) = result > 16383 ? 16383 : result; /* want u4.10 */
+ 		}

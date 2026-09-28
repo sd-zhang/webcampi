@@ -1,0 +1,259 @@
+From: PiSight development <pisight@local>
+Subject: [PATCH] Remove shutter monitoring and frame freezing
+
+Keep GPIO control for the running and streaming LEDs only. Accept the old
+three-pin argument for compatibility but never configure or read the shutter
+pin. Streaming follows the host independently of the physical cover.
+
+The image also starts pigpiod with alerts disabled to remove its continuous
+sampling CPU thread; ordinary LED reads and writes remain available.
+
+--- a/include/uvcgadget/gpio.h
++++ b/include/uvcgadget/gpio.h
+@@ -13,17 +13,12 @@
+ 
+ enum gpio_pin_name { 
+     RUNNING,
+-    STREAMING,
+-    SENSOR
++    STREAMING
+ };
+ 
+ struct gpio_ctrl;
+ 
+-typedef void (*gpio_stream_cb_t)(void *userdata, int state);
+-
+ int gpio_set_pin_state(void *g, int pin_name, int state);
+-
+-void gpio_set_stream_callback(struct gpio_ctrl *gpio, gpio_stream_cb_t cb, void *ud);
+ 
+ int gpio_init(struct gpio_ctrl *gpio);
+ 
+--- a/include/uvcgadget/stream.h
++++ b/include/uvcgadget/stream.h
+@@ -118,8 +118,6 @@
+  */
+ void uvc_stream_enable(struct uvc_stream *stream, int enable);
+ 
+-void uvc_stream_set_frozen(void *s, int state);
+-
+ void uvc_stream_set_gpio_callback(struct uvc_stream *stream, uvc_stream_gpio_cb_t cb, void *ud);
+ 
+ #endif /* __STREAM_H__ */
+--- a/lib/gpio.c
++++ b/lib/gpio.c
+@@ -19,9 +19,6 @@
+ 
+ struct gpio_ctrl {
+     int pi;
+-
+-    gpio_stream_cb_t stream_cb;
+-    void *stream_ud;
+ 
+     int num_pins;
+     struct gpio_pin *pins[];
+@@ -56,33 +53,8 @@
+     return 0;
+ }
+ 
+-void gpio_set_stream_callback(struct gpio_ctrl *gpio, gpio_stream_cb_t cb, void *ud)
+-{
+-    gpio->stream_cb = cb;
+-    gpio->stream_ud = ud;
+-}
+-
+-static void gpio_sensor_callback(int pi __attribute__((unused)), uint32_t pin_num __attribute__((unused)),
+-                uint32_t level, uint32_t tick __attribute__((unused)), void *g)
+-{
+-    struct gpio_ctrl *gpio = g;
+-
+-    gpio->pins[SENSOR]->state = level;
+-
+-    printf("Read sensor pin %s -> stream %s\n",
+-        gpio->pins[SENSOR]->state == LOW ? "LOW" : "HIGH",
+-        gpio->pins[SENSOR]->state == LOW ? "on" : "off");
+-
+-    gpio->stream_cb(gpio->stream_ud, gpio->pins[SENSOR]->state);
+-}
+-
+ int gpio_init(struct gpio_ctrl *gpio)
+ {
+-    /* Disable pigpio's internal signal handler. */
+-	//int cfg = gpioCfgGetInternals();
+-	//cfg |= PI_CFG_NOSIGHANDLER;
+-	//gpioCfgSetInternals(cfg);
+-
+ 	if ((gpio->pi = pigpio_start(NULL, NULL)) < 0) {
+ 		printf("Failed to initialize GPIO\n");
+ 		return 1;
+@@ -100,32 +72,15 @@
+     if (gpio_set_pin_state(gpio, RUNNING, HIGH))
+         return 1;
+ 
+-    if ((ret = set_glitch_filter(gpio->pi, gpio->pins[SENSOR]->num, 100000)) < 0) {
+-        printf("Failed to set GPIO glitch filter: %s (%d)\n", strerr(ret), ret);
+-        return 1;
+-    }
+-
+-    if ((ret = callback_ex(gpio->pi, gpio->pins[SENSOR]->num, EITHER_EDGE, gpio_sensor_callback, gpio)) < 0) {
+-        printf("Failed to set GPIO alert function: %s (%d)\n", strerr(ret), ret);
+-        return 1;
+-    }
+-
+-    if ((ret = gpio_read(gpio->pi, gpio->pins[SENSOR]->num)) < 0) {
+-        printf("Failed to read GPIO: %s (%d)\n", strerr(ret), ret);
+-        return 1;
+-    }
+-
+-    gpio->pins[SENSOR]->state = ret;
+-    gpio_sensor_callback(gpio->pi, gpio->pins[SENSOR]->num, gpio->pins[SENSOR]->state, 0, gpio);
+-
+     return 0;
+ }
+ 
+ struct gpio_ctrl *gpio_create(char *pinlist) {
+-    int num_pins = 3;
++    int num_pins = 2;
+     int v[num_pins];
+ 
+-    if (sscanf(pinlist, "%d %d %d", &v[0], &v[1], &v[2]) != num_pins)
++    /* Accept legacy three-pin arguments, but never access the shutter pin. */
++    if (sscanf(pinlist, "%d %d", &v[0], &v[1]) != num_pins)
+         return NULL;
+ 
+     struct gpio_ctrl *gpio = malloc(sizeof *gpio + num_pins * sizeof *gpio->pins);
+@@ -140,11 +95,6 @@
+     streaming->num = v[1];
+     streaming->mode = PI_OUTPUT;
+     gpio->pins[1] = streaming;
+-
+-    struct gpio_pin *sensor = malloc(sizeof *sensor);
+-    sensor->num = v[2];
+-    sensor->mode = PI_INPUT;
+-    gpio->pins[2] = sensor;
+ 
+     return gpio;
+ }
+--- a/lib/stream.c
++++ b/lib/stream.c
+@@ -36,10 +36,6 @@
+ 
+ 	int active;
+ 
+-	void *frozen_data;
+-	size_t frozen_size;
+-	int frozen;
+-
+ 	uvc_stream_gpio_cb_t gpio_cb;
+ 	void *gpio_ud;
+ };
+@@ -47,19 +43,6 @@
+ /* ---------------------------------------------------------------------------
+  * Video streaming
+  */
+-
+-static void uvc_stream_spoof_buffer(void *d, struct video_buffer *buffer)
+-{
+-	struct uvc_stream *stream = d;
+-
+-	if (!stream->frozen_data) {
+-		stream->frozen_size = buffer->bytesused;
+-		stream->frozen_data = malloc(stream->frozen_size);
+-		memset(stream->frozen_data, 0, stream->frozen_size);
+-	}
+-	memcpy(buffer->mem, stream->frozen_data, stream->frozen_size);
+-	buffer->bytesused = stream->frozen_size;
+-}
+ 
+ /* Diagnostic: set on stream enable, cleared after logging the first frame. */
+ static int uvc_dbg_first_frame;
+@@ -77,9 +60,6 @@
+ 			buffer->index, buffer->bytesused);
+ 	}
+ 
+-	if (stream->frozen)
+-		uvc_stream_spoof_buffer(stream, buffer);
+-
+ 	v4l2_queue_buffer(sink, buffer);
+ }
+ 
+@@ -109,9 +89,6 @@
+ 		return;
+ 
+ 	video_source_fill_buffer(stream->src, &buf);
+-
+-	if (stream->frozen)
+-		uvc_stream_spoof_buffer(stream, &buf);
+ 
+ 	v4l2_queue_buffer(sink, &buf);
+ }
+@@ -328,7 +305,7 @@
+ 
+ 	stream->active = enable;
+ 
+-	if (stream->gpio_cb && !stream->frozen)
++	if (stream->gpio_cb)
+ 		stream->gpio_cb(stream->gpio_ud, STREAMING, enable);
+ }
+ 
+@@ -357,22 +334,6 @@
+ int uvc_stream_set_control(struct uvc_stream *stream, enum video_source_control control, int value)
+ {
+ 	return video_source_set_control(stream->src, control, value);
+-}
+-
+-void uvc_stream_set_frozen(void *s, int state)
+-{
+-	struct uvc_stream *stream = s;
+-
+-	if (!state && stream->frozen_data) {
+-		free(stream->frozen_data);
+-		stream->frozen_data = NULL;
+-		stream->frozen_size = 0;
+-	}
+-
+-	if (stream->active)
+-		stream->gpio_cb(stream->gpio_ud, STREAMING, !state);
+-
+-	stream->frozen = state;
+ }
+ 
+ void uvc_stream_set_gpio_callback(struct uvc_stream *stream, uvc_stream_gpio_cb_t cb, void *ud)
+@@ -400,7 +361,6 @@
+ 		goto error;
+ 
+ 	stream->active = 0;
+-	stream->frozen = 0;
+ 
+ 	return stream;
+ 
+@@ -416,9 +376,6 @@
+ 
+ 	uvc_close(stream->uvc);
+ 
+-	if (stream->frozen_data)
+-		free(stream->frozen_data);
+-
+ 	free(stream);
+ }
+ 
+--- a/src/main.c
++++ b/src/main.c
+@@ -33,7 +33,7 @@
+ 	fprintf(stderr, " -i image	MJPEG image\n");
+ 	fprintf(stderr, " -s directory	directory of slideshow images\n");
+ #ifdef HAVE_PIGPIO
+-	fprintf(stderr, " -p pins	Space-separated pins for running, streaming, and sensor\n");
++	fprintf(stderr, " -p pins	Space-separated pins for running and streaming LEDs\n");
+ #endif
+ 	fprintf(stderr, " -h		Print this help screen and exit\n");
+ 	fprintf(stderr, "\n");
+@@ -189,8 +189,6 @@
+ 			goto done;
+ 		}
+ 
+-		gpio_set_stream_callback(gpio, uvc_stream_set_frozen, stream);
+-
+ 		uvc_stream_set_gpio_callback(stream, gpio_set_pin_state, gpio);
+ 
+ 		if (gpio_init(gpio)) {

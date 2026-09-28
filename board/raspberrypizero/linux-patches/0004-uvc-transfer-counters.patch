@@ -1,0 +1,73 @@
+usb: gadget: uvc: report per-stream missed-transfer counters
+
+Count completion errors under req_lock and report at stream-off. Keep the
+existing recovery behavior and avoid per-transfer logging on the Pi Zero.
+
+--- a/drivers/usb/gadget/function/uvc.h
++++ b/drivers/usb/gadget/function/uvc.h
+@@ -117,6 +117,8 @@
+ 	spinlock_t req_lock;
+ 
+ 	unsigned int req_int_count;
++	/* Per-stream completion errors; protected by req_lock. */
++	u32 missed_payload, missed_empty, transfer_errors;
+ 
+ 	void (*encode) (struct usb_request *req, struct uvc_video *video,
+ 			struct uvc_buffer *buf);
+--- a/drivers/usb/gadget/function/uvc_video.c
++++ b/drivers/usb/gadget/function/uvc_video.c
+@@ -391,6 +391,16 @@
+ 		return;
+ 	}
+ 
++	/* Keep missed transfers observable without per-microframe logging. */
++	if (req->status == -EXDEV || req->status == -ENODATA) {
++		if (req->length)
++			video->missed_payload++;
++		else
++			video->missed_empty++;
++	} else if (req->status && req->status != -ESHUTDOWN) {
++		video->transfer_errors++;
++	}
++
+ 	last_buf = ureq->last_buf;
+ 	ureq->last_buf = NULL;
+ 	spin_unlock_irqrestore(&video->req_lock, flags);
+@@ -648,6 +658,7 @@
+ uvcg_video_disable(struct uvc_video *video)
+ {
+ 	unsigned long flags;
++	u32 missed_payload, missed_empty, transfer_errors;
+ 	struct list_head inflight_bufs;
+ 	struct usb_request *req, *temp;
+ 	struct uvc_buffer *buf, *btemp;
+@@ -662,6 +673,9 @@
+ 	INIT_LIST_HEAD(&inflight_bufs);
+ 	spin_lock_irqsave(&video->req_lock, flags);
+ 	video->is_enabled = false;
++	missed_payload = video->missed_payload;
++	missed_empty = video->missed_empty;
++	transfer_errors = video->transfer_errors;
+ 
+ 	/*
+ 	 * Remove any in-flight buffers from the uvc_requests
+@@ -718,6 +732,9 @@
+ 	spin_unlock_irqrestore(&video->queue.irqlock, flags);
+ 
+ 	uvcg_queue_enable(&video->queue, 0);
++	uvcg_info(&video->uvc->func,
++		  "USB transfer summary: missed_payload=%u missed_empty=%u other_errors=%u\n",
++		  missed_payload, missed_empty, transfer_errors);
+ 	return 0;
+ }
+ 
+@@ -740,6 +757,9 @@
+ 	 * request handling thread will become active until this function
+ 	 * returns.
+ 	 */
++	video->missed_payload = 0;
++	video->missed_empty = 0;
++	video->transfer_errors = 0;
+ 	video->is_enabled = true;
+ 
+ 	if ((ret = uvcg_queue_enable(&video->queue, 1)) < 0)

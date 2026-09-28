@@ -1,0 +1,30 @@
+#!/bin/sh
+# Capture the raw I2S card before S61pisight-mic opens it for alsaloop.
+
+case "$1" in
+	start)
+		state=0
+		IFS= read -r state 2>/dev/null < /run/pisight-diagnostics || true
+		[ "$state" = 1 ] || exit 0
+		(
+			attempt=0
+			while [ ! -e /proc/asound/PiSightMic ]; do
+				attempt=$((attempt + 1))
+				[ "$attempt" -lt 10 ] || { echo 'PiSightMic ALSA card did not appear'; exit 1; }
+				sleep 1
+			done
+			arecord -q -D hw:CARD=PiSightMic,DEV=0 -f S32_LE -c 2 \
+				-r 48000 -d 2 -t raw /tmp/pisight-i2s-stereo.s32 &
+			capture_pid=$!
+			( sleep 8; kill "$capture_pid" 2>/dev/null ) &
+			watchdog_pid=$!
+			wait "$capture_pid"
+			status=$?
+			kill "$watchdog_pid" 2>/dev/null || true
+			wait "$watchdog_pid" 2>/dev/null || true
+			echo "arecord exit status: $status"
+		) > /tmp/pisight-i2s-capture.log 2>&1
+		;;
+	stop) ;;
+	*) exit 1 ;;
+esac

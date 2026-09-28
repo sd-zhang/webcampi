@@ -1,0 +1,6 @@
+# The ICS43434 microphone owns PCM/I2S. pigpio defaults to PCM and would
+# leave TXON set, causing bcm2835-i2s to skip microphone configuration.
+# Retain PWM clock selection even with alerts disabled: pigpio still initializes
+# its DMA clock. LEDs only need direct reads/writes; no shutter monitoring.
+# -m prevents the continuously running GPIO alert/sampling CPU thread.
+PIGPIOD_ARGS="-t 0 -m"

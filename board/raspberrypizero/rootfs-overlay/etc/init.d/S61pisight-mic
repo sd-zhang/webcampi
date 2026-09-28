@@ -16,8 +16,7 @@ start() {
 			[ "$attempt" -lt 10 ] || { echo "ALSA cards did not appear"; exit 1; }
 			sleep 1
 		done
-		exec alsaloop -C pisight_mic -P hw:CARD=UAC2Gadget,DEV=0 \
-			-f S16_LE -c 1 -r 48000 -t 50000 -n
+		exec /usr/bin/pisight-mic
 	) > "$LOG" 2>&1 &
 	echo $! > "$PIDFILE"
 	echo OK

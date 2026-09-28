@@ -1,0 +1,379 @@
+From: PiSight diagnostics
+Subject: [PATCH] dwc2: record bounded isochronous interrupt-cause evidence
+
+Diagnostic only. Preserve transfer selection and recovery behavior. Record
+interrupt causes, handler time, request arm frames and bounded disable-decision
+samples. An early-EOPF classification is conditional timing evidence, not a
+claim of audio origin or preventable packet loss. No printing in IRQ context.
+
+--- a/drivers/usb/dwc2/core.h
++++ b/drivers/usb/dwc2/core.h
+@@ -15,6 +15,7 @@
+ #include <linux/usb/otg.h>
+ #include <linux/usb/phy.h>
+ #include "hw.h"
++#include "isoc-diag.h"
+ 
+ /*
+  * Suggested defines for tracers:
+@@ -161,6 +162,7 @@
+ 	bool			frame_overrun;
+ 	struct dwc2_isoc_diag isoc_diag[4];
+ 	u32 diag_irq, diag_sessions;
++	struct dwc2_diag_arm diag_arm;
+ 
+ 	dma_addr_t		desc_list_dma;
+ 	struct dwc2_dma_desc	*desc_list;
+@@ -1066,6 +1068,7 @@
+  *
+  */
+ struct dwc2_hsotg {
++	struct dwc2_irq_diag irq_diag;
+ 	struct device *dev;
+ 	void __iomem *regs;
+ 	/** Params detected from hardware */
+--- a/drivers/usb/dwc2/core_intr.c
++++ b/drivers/usb/dwc2/core_intr.c
+@@ -863,6 +863,11 @@
+ 				       & HFNUM_FRNUM_MASK) >> HFNUM_FRNUM_SHIFT;
+ 
+ 	gintsts = dwc2_read_common_intr(hsotg);
++	if (gintsts & (GINTSTS_MODEMIS | GINTSTS_CONIDSTSCHNG |
++		       GINTSTS_DISCONNINT | GINTSTS_USBSUSP | GINTSTS_WKUPINT)) {
++		hsotg->irq_diag.last_valid = false;
++		hsotg->irq_diag.current_valid = false;
++	}
+ 	if (gintsts & ~GINTSTS_PRTINT)
+ 		retval = IRQ_HANDLED;
+ 
+--- a/drivers/usb/dwc2/debugfs.c
++++ b/drivers/usb/dwc2/debugfs.c
+@@ -10,6 +10,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/seq_file.h>
+ #include <linux/uaccess.h>
++#include <linux/slab.h>
+ 
+ #include "core.h"
+ #include "debug.h"
+@@ -291,6 +292,51 @@
+  */
+ /* Read-only lifetime counters. Retain them across stream reopens so a
+  * periodic logger cannot miss a short session. Never format in IRQ context. */
++static void dwc2_diag_show_decision(struct seq_file *seq, const char *kind,
++				    const struct dwc2_diag_decision *s)
++{
++	seq_printf(seq, "irq_decision %s ep=%u session=%u ns=%llu previous_ns=%llu previous_frame=%u entry_frame=%u live=%u cached=%u target=%u ctrl=%#x epint=%#x epsize=%#x dcfg=%#x status=%#x before_eopf=%u arm_serial=%u arm_target=%u arm_before=%u arm_after=%u arm_length=%u\n",
++		   kind, s->ep, s->session, (unsigned long long)s->ns,
++		   (unsigned long long)s->previous_ns, s->previous_frame,
++		   s->entry_frame, s->live, s->cached, s->target, s->epctrl,
++		   s->epint, s->epsize, s->dcfg, s->status, s->before_eopf,
++		   s->arm.serial, s->arm.target, s->arm.before_frame,
++		   s->arm.after_frame, s->arm.length);
++}
++
++static int dwc2_diag_show_irq(struct seq_file *seq, struct dwc2_hsotg *hsotg)
++{
++	struct dwc2_irq_diag *d;
++	unsigned long flags;
++	unsigned int i;
++
++	d = kmalloc(sizeof(*d), GFP_KERNEL);
++	if (!d)
++		return -ENOMEM;
++	spin_lock_irqsave(&hsotg->lock, flags);
++	*d = hsotg->irq_diag;
++	spin_unlock_irqrestore(&hsotg->lock, flags);
++	seq_printf(seq, "irq_causes passes=%u incomplete=%u before_eopf=%u selected=%u selected_early=%u probe_ns=%llu\n",
++		   d->passes, d->incomplete, d->before_eopf, d->selected,
++		   d->selected_early, (unsigned long long)d->probe_ns);
++	seq_printf(seq, "irq_work entries=%u in_passes=%u out_passes=%u incomplete_only=%u handler_ns=%llu handler_max_ns=%u\n",
++		   d->entries, d->in_passes, d->out_passes, d->incomplete_only,
++		   (unsigned long long)d->handler_ns, d->handler_max_ns);
++	seq_printf(seq, "irq_coverage adjacent=%u selected_current=%u selected_current_adjacent=%u\n",
++		   d->adjacent, d->selected_current, d->selected_current_adjacent);
++	for (i = 1; i < ARRAY_SIZE(d->waiting); i++) {
++		if (d->waiting[i] || d->decisions[i] || d->nak[i] || d->complete[i])
++			seq_printf(seq, "irq_endpoint ep=%u waiting=%u selected=%u nak=%u complete=%u\n",
++				   i, d->waiting[i], d->decisions[i], d->nak[i], d->complete[i]);
++	}
++	for (i = 0; i < d->sample_count; i++)
++		dwc2_diag_show_decision(seq, "first", &d->samples[i]);
++	for (i = 0; i < d->early_count; i++)
++		dwc2_diag_show_decision(seq, "early", &d->early_samples[i]);
++	kfree(d);
++	return 0;
++}
++
+ static int isoc_stats_show(struct seq_file *seq, void *v)
+ {
+ 	struct dwc2_hsotg *hsotg = seq->private;
+@@ -298,6 +344,11 @@
+ 	static const char * const labels[] = { "first_burst", "last_burst", "worst_burst" };
+ 	unsigned int index, direction, i, j;
+ 	unsigned long flags;
++	int ret;
++
++	ret = dwc2_diag_show_irq(seq, hsotg);
++	if (ret)
++		return ret;
+ 
+ 	for (direction = 0; direction < 2; ++direction) {
+ 		for (index = 1; index < hsotg->num_of_eps; ++index) {
+--- a/drivers/usb/dwc2/gadget.c
++++ b/drivers/usb/dwc2/gadget.c
+@@ -1058,6 +1058,98 @@
+ 			d->worst_updated = true;
+ 		}
+ 	}
++}
++
++/* Diagnostic only: no policy changes, allocation, or printing in IRQ. */
++static void dwc2_diag_irq_snapshot(struct dwc2_hsotg *hsotg, u32 status, u32 mask)
++{
++	struct dwc2_irq_diag *d = &hsotg->irq_diag;
++	u64 before = ktime_get_ns();
++	u32 dsts = dwc2_readl(hsotg, DSTS);
++	u32 frame = (dsts & DSTS_SOFFN_MASK) >> DSTS_SOFFN_SHIFT;
++	u64 after = ktime_get_ns();
++	bool valid = hsotg->gadget.speed == USB_SPEED_HIGH &&
++		     hsotg->lx_state == DWC2_L0 && !hsotg->bus_suspended &&
++		     !(dsts & (DSTS_SUSPSTS | DSTS_ERRATICERR)) &&
++		     using_dma(hsotg) && !using_desc_dma(hsotg) &&
++		     !(status & (GINTSTS_USBRST | GINTSTS_RESETDET |
++				 GINTSTS_ENUMDONE | GINTSTS_USBSUSP |
++				 GINTSTS_WKUPINT | GINTSTS_DISCONNINT));
++
++	d->passes++;
++	if (status & mask & GINTSTS_IEPINT)
++		d->in_passes++;
++	if (status & mask & GINTSTS_OEPINT)
++		d->out_passes++;
++	d->probe_ns += after - before;
++	d->previous_ns = d->last_ns;
++	d->previous_frame = d->last_frame;
++	d->entry_frame = frame;
++	d->current_valid = valid && d->last_valid;
++	if (d->current_valid && (((d->previous_frame + 1) & 0x3fff) == frame))
++		d->adjacent++;
++	d->last_valid = valid;
++	d->last_ns = before;
++	d->last_frame = frame;
++	if (status & mask & GINTSTS_INCOMPL_SOIN) {
++		if (!(status & mask & (GINTSTS_IEPINT | GINTSTS_OEPINT)))
++			d->incomplete_only++;
++		d->incomplete++;
++		d->dcfg = dwc2_readl(hsotg, DCFG);
++		if (dwc2_diag_before_eopf(d->current_valid, d->previous_frame,
++					d->previous_ns, frame, after, d->dcfg))
++			d->before_eopf++;
++	}
++}
++
++static void dwc2_diag_disable_decision(struct dwc2_hsotg *hsotg,
++				      struct dwc2_hsotg_ep *ep, u32 ctrl)
++{
++	struct dwc2_irq_diag *d = &hsotg->irq_diag;
++	struct dwc2_diag_decision s = { 0 };
++	u32 dsts;
++	bool valid;
++
++	d->selected++;
++	d->decisions[ep->index]++;
++	s.previous_ns = d->previous_ns;
++	s.previous_frame = d->previous_frame;
++	s.entry_frame = d->entry_frame;
++	s.cached = hsotg->frame_number;
++	s.target = ep->target_frame;
++	s.epctrl = ctrl;
++	s.epint = dwc2_readl(hsotg, DIEPINT(ep->index));
++	s.epsize = dwc2_readl(hsotg, DIEPTSIZ(ep->index));
++	dsts = dwc2_readl(hsotg, DSTS);
++	s.live = (dsts & DSTS_SOFFN_MASK) >> DSTS_SOFFN_SHIFT;
++	s.status = dwc2_readl(hsotg, GINTSTS);
++	s.ns = ktime_get_ns();
++	s.dcfg = d->dcfg;
++	s.ep = ep->index;
++	s.session = ep->diag_sessions;
++	s.arm = ep->diag_arm;
++	valid = d->current_valid && hsotg->gadget.speed == USB_SPEED_HIGH &&
++		hsotg->lx_state == DWC2_L0 && !hsotg->bus_suspended &&
++		!(dsts & (DSTS_SUSPSTS | DSTS_ERRATICERR)) &&
++		!(s.status & (GINTSTS_USBRST | GINTSTS_RESETDET |
++			      GINTSTS_ENUMDONE | GINTSTS_USBSUSP |
++			      GINTSTS_WKUPINT | GINTSTS_DISCONNINT));
++	if (s.target == s.live) {
++		d->selected_current++;
++		if (valid && s.live == d->entry_frame &&
++		    (((d->previous_frame + 1) & 0x3fff) == s.live))
++			d->selected_current_adjacent++;
++	}
++	s.before_eopf = valid && s.live == d->entry_frame &&
++		dwc2_diag_before_eopf(d->current_valid, d->previous_frame,
++				     d->previous_ns, s.live, s.ns, s.dcfg);
++	if (s.before_eopf && s.target == s.live) {
++		d->selected_early++;
++		if (d->early_count < ARRAY_SIZE(d->early_samples))
++			d->early_samples[d->early_count++] = s;
++	}
++	if (d->sample_count < ARRAY_SIZE(d->samples))
++		d->samples[d->sample_count++] = s;
+ }
+ 
+ static bool dwc2_gadget_target_frame_elapsed(struct dwc2_hsotg_ep *hs_ep);
+@@ -1245,7 +1337,15 @@
+ 		ctrl |= DXEPCTL_CNAK;	/* clear NAK set by core */
+ 
+ 	dev_dbg(hsotg->dev, "%s: DxEPCTL=0x%08x\n", __func__, ctrl);
++	if (hs_ep->isochronous && hs_ep->dir_in) {
++		hs_ep->diag_arm.serial++;
++		hs_ep->diag_arm.target = hs_ep->target_frame;
++		hs_ep->diag_arm.length = length;
++		hs_ep->diag_arm.before_frame = dwc2_hsotg_read_frameno(hsotg);
++	}
+ 	dwc2_writel(hsotg, ctrl, epctrl_reg);
++	if (hs_ep->isochronous && hs_ep->dir_in)
++		hs_ep->diag_arm.after_frame = dwc2_hsotg_read_frameno(hsotg);
+ 
+ 	/*
+ 	 * set these, it seems that DMA support increments past the end
+@@ -3098,6 +3198,12 @@
+ 		__func__, idx, dir_in ? "in" : "out", ints);
+ 
+ 	hs_ep->diag_irq = ints;
++	if (dir_in && hs_ep->isochronous && idx < 16) {
++		if (ints & DXEPINT_NAKINTRPT)
++			hsotg->irq_diag.nak[idx]++;
++		if (ints & DXEPINT_XFERCOMPL)
++			hsotg->irq_diag.complete[idx]++;
++	}
+ 
+ 	/* Don't process XferCompl interrupt if it is a setup packet */
+ 	if (idx == 0 && (ints & (DXEPINT_SETUP | DXEPINT_SETUP_RCVD)))
+@@ -3362,6 +3468,8 @@
+ void dwc2_hsotg_disconnect(struct dwc2_hsotg *hsotg)
+ {
+ 	unsigned int ep;
++	hsotg->irq_diag.last_valid = false;
++	hsotg->irq_diag.current_valid = false;
+ 
+ 	if (!hsotg->connected)
+ 		return;
+@@ -3436,6 +3544,8 @@
+ 	u32 usbcfg;
+ 	u32 dcfg = 0;
+ 	int ep;
++	hsotg->irq_diag.last_valid = false;
++	hsotg->irq_diag.current_valid = false;
+ 
+ 	/* Kill any ep0 requests as controller will be reinitialized */
+ 	kill_all_requests(hsotg, hsotg->eps_out[0], -ECONNRESET);
+@@ -3683,7 +3793,11 @@
+ 
+ 		epctrl = dwc2_readl(hsotg, DIEPCTL(idx));
+ 		if ((epctrl & DXEPCTL_EPENA) &&
++		    !dwc2_gadget_target_frame_elapsed(hs_ep))
++			hsotg->irq_diag.waiting[idx]++;
++		if ((epctrl & DXEPCTL_EPENA) &&
+ 		    dwc2_gadget_target_frame_elapsed(hs_ep)) {
++			dwc2_diag_disable_decision(hsotg, hs_ep, epctrl);
+ 			epctrl |= DXEPCTL_SNAK;
+ 			epctrl |= DXEPCTL_EPDIS;
+ 			dwc2_writel(hsotg, epctrl, DIEPCTL(idx));
+@@ -3756,13 +3870,16 @@
+ {
+ 	struct dwc2_hsotg *hsotg = pw;
+ 	int retry_count = 8;
++	u64 diag_begin, diag_elapsed;
+ 	u32 gintsts;
+ 	u32 gintmsk;
+ 
+ 	if (!dwc2_is_device_mode(hsotg))
+ 		return IRQ_NONE;
+ 
++	diag_begin = ktime_get_ns();
+ 	spin_lock(&hsotg->lock);
++	hsotg->irq_diag.entries++;
+ irq_retry:
+ 	gintsts = dwc2_readl(hsotg, GINTSTS);
+ 	gintmsk = dwc2_readl(hsotg, GINTMSK);
+@@ -3770,6 +3887,7 @@
+ 	dev_dbg(hsotg->dev, "%s: %08x %08x (%08x) retry %d\n",
+ 		__func__, gintsts, gintsts & gintmsk, gintmsk, retry_count);
+ 
++	dwc2_diag_irq_snapshot(hsotg, gintsts, gintmsk);
+ 	gintsts &= gintmsk;
+ 
+ 	if (gintsts & GINTSTS_RESETDET) {
+@@ -3956,6 +4074,10 @@
+ 	if (hsotg->params.service_interval)
+ 		dwc2_gadget_wkup_alert_handler(hsotg);
+ 
++	diag_elapsed = ktime_get_ns() - diag_begin;
++	hsotg->irq_diag.handler_ns += diag_elapsed;
++	if (diag_elapsed > hsotg->irq_diag.handler_max_ns)
++		hsotg->irq_diag.handler_max_ns = min_t(u64, diag_elapsed, U32_MAX);
+ 	spin_unlock(&hsotg->lock);
+ 
+ 	return IRQ_HANDLED;
+@@ -5153,6 +5275,8 @@
+ 			 hsotg->driver->driver.name);
+ 
+ 		spin_lock_irqsave(&hsotg->lock, flags);
++		hsotg->irq_diag.last_valid = false;
++		hsotg->irq_diag.current_valid = false;
+ 		if (hsotg->enabled)
+ 			dwc2_hsotg_core_disconnect(hsotg);
+ 		dwc2_hsotg_disconnect(hsotg);
+@@ -5182,6 +5306,8 @@
+ 			 hsotg->driver->driver.name);
+ 
+ 		spin_lock_irqsave(&hsotg->lock, flags);
++		hsotg->irq_diag.last_valid = false;
++		hsotg->irq_diag.current_valid = false;
+ 		dwc2_hsotg_core_init_disconnected(hsotg, false);
+ 		if (hsotg->enabled) {
+ 			/* Enable ACG feature in device mode,if supported */
+--- /dev/null
++++ b/drivers/usb/dwc2/isoc-diag.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef DWC2_ISOC_DIAG_H
++#define DWC2_ISOC_DIAG_H
++
++/* An upper bound on current microframe age, not an event timestamp.
++ * Requires live adjacent HS frame reads in one uninterrupted bus epoch.
++ * Leave 10 us margin below the earliest configured EOPF. */
++static inline bool dwc2_diag_before_eopf(bool valid, u32 previous, u64 before,
++				       u32 current_frame, u64 after, u32 dcfg)
++{
++	u64 cutoff = 90000 + 6250 * ((dcfg >> 11) & 3);
++
++	return valid && (((previous + 1) & 0x3fff) == current_frame) &&
++	       after >= before && after - before < cutoff;
++}
++
++struct dwc2_diag_arm {
++	u32 serial, target, before_frame, after_frame, length;
++};
++
++struct dwc2_diag_decision {
++	u64 ns, previous_ns;
++	u32 previous_frame, entry_frame, live, cached, target;
++	u32 epctrl, epint, epsize, dcfg, session, ep, status;
++	bool before_eopf;
++	struct dwc2_diag_arm arm;
++};
++
++struct dwc2_irq_diag {
++	u64 last_ns, previous_ns, probe_ns, handler_ns;
++	u32 entries, handler_max_ns, in_passes, out_passes, incomplete_only;
++	u32 last_frame, previous_frame, entry_frame, dcfg;
++	u32 passes, incomplete, before_eopf, selected, selected_early;
++	u32 adjacent, selected_current, selected_current_adjacent;
++	u32 waiting[16], decisions[16], nak[16], complete[16];
++	bool last_valid, current_valid;
++	unsigned int sample_count, early_count;
++	struct dwc2_diag_decision samples[8], early_samples[8];
++};
++#endif
