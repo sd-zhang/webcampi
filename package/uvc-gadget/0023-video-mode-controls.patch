@@ -1,0 +1,64 @@
+UVC: selectable advertised video modes and software reboot capability
+
+--- a/lib/uvc.c
++++ b/lib/uvc.c
+@@ -268,7 +268,7 @@
+ 	int maximum;
+ 	int resolution;
+ 
+-	if (dev->xu_unit && entity == dev->xu_unit && (cs == 3 || cs == 4)) {
++	if (dev->xu_unit && entity == dev->xu_unit && (cs >= 3 && cs <= 5)) {
+ 		if (req == UVC_SET_CUR && len == 32) {
+ 			dev->control_entity = entity; dev->control = cs; resp->length = 32;
+ 		} else if (req == UVC_GET_LEN && len == 2) {
+@@ -477,7 +477,7 @@
+ {
+ 	return dev->xu_unit && ctrl->wIndex >> 8 == dev->xu_unit &&
+ 		(ctrl->wIndex & 0xff) == UVC_STRING_CONTROL_IDX &&
+-		(ctrl->wValue == 0x0200 || ctrl->wValue == 0x0300 || ctrl->wValue == 0x0400) &&
++		(ctrl->wValue == 0x0200 || ctrl->wValue == 0x0300 || ctrl->wValue == 0x0400 || ctrl->wValue == 0x0500) &&
+ 		(ctrl->bRequestType == 0xa1 || ctrl->bRequestType == 0x21);
+ }
+ 
+@@ -490,7 +490,7 @@
+ 	dev->control_entity = 0;
+ 
+ 	if (dev->xu_unit && ctrl->wIndex >> 8 == dev->xu_unit &&
+-	    (ctrl->wValue >> 8 >= 2 && ctrl->wValue >> 8 <= 4)) {
++	    (ctrl->wValue >> 8 >= 2 && ctrl->wValue >> 8 <= 5)) {
+ 		if (!uvc_is_diagnostic(dev, ctrl))
+ 			return;
+ 		/* Reject direction/request mismatches before arming a data stage. */
+@@ -554,7 +554,7 @@
+ uvc_events_process_data(struct uvc_device *dev,
+ 			const struct uvc_request_data *data)
+ {
+-	if (dev->xu_unit && dev->control_entity == dev->xu_unit && (dev->control == 3 || dev->control == 4)) {
++	if (dev->xu_unit && dev->control_entity == dev->xu_unit && (dev->control >= 3 && dev->control <= 5)) {
+ 		pisight_controls_command(&dev->settings, dev->control - 3, data->data, data->length);
+ 		dev->control_entity = 0; dev->control = 0;
+ 		return;
+@@ -721,7 +721,7 @@
+ 		break;
+ 
+ 	case UVC_EVENT_DATA:
+-		if (!(dev->xu_unit && dev->control_entity == dev->xu_unit && dev->control >= 2 && dev->control <= 4))
++		if (!(dev->xu_unit && dev->control_entity == dev->xu_unit && dev->control >= 2 && dev->control <= 5))
+ 			uvc_log("EVENT_DATA\n");
+ 		uvc_events_process_data(dev, &uvc_event->data);
+ 		return;
+--- a/scripts/uvc-gadget.sh
++++ b/scripts/uvc-gadget.sh
+@@ -112,9 +112,9 @@
+ 		# Set this XU as the source for the default output terminal
+ 		cat bUnitID > ../../terminal/output/default/bSourceID
+ 
+-		# Selectors: 1 camera settings, 2 snapshots, 3 audio, 4 diagnostics.
+-		echo 4 > bNumControls
+-		echo 0x0f > bmControls
++		# Selectors: 1 camera settings, 2 snapshots, 3 audio, 4 diagnostics, 5 video modes.
++		echo 5 > bNumControls
++		echo 0x1f > bmControls
+ 
+ 		# Stable 16-byte GUID, also used by the host configurator.
+ 		printf 'PiSightSettings1' > guidExtensionCode

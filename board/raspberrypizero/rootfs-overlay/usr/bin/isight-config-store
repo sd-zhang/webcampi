@@ -9,6 +9,7 @@ if [ "$1" = --locked ]; then shift; else
     exec /usr/bin/isight-config-lock "$0" --locked "$@"
 fi
 mode=camera
+reboot_after_save=0
 if [ "$1" = --audio ]; then
     shift; [ "$#" -eq 4 ] || exit 2
     mode=audio; gain=$1 hp=$2 lp=$3 bypass=$4
@@ -18,6 +19,11 @@ if [ "$1" = --audio ]; then
     { [ "$hp" -eq 0 ] || { [ "$hp" -ge 20 ] && [ "$hp" -le 500 ]; }; } || exit 2
     { [ "$lp" -eq 0 ] || { [ "$lp" -ge 1000 ] && [ "$lp" -le 20000 ] && [ "$((lp % 100))" -eq 0 ]; }; } || exit 2
     case "$bypass" in 0|1) ;; *) exit 2 ;; esac
+elif [ "$1" = --resolutions ] || [ "$1" = --resolutions-reboot ]; then
+    [ "$1" != --resolutions-reboot ] || reboot_after_save=1
+    shift; [ "$#" -eq 1 ] || exit 2
+    mode=resolutions; modes=$1
+    case "$modes" in 1|2|3|4|5|6|7) ;; *) exit 2 ;; esac
 elif [ "$1" = --diagnostics ]; then
     shift; [ "$#" -eq 1 ] || exit 2
     mode=diagnostics; diagnostics=$1
@@ -52,6 +58,11 @@ case "$mode" in
  audio)
     jq --argjson gain "$gain" --argjson hp "$hp" --argjson lp "$lp" --argjson bypass "$bypass" \
        '.audio = {gain_db: ($gain / 10), highpass_hz: $hp, lowpass_hz: $lp, bypass: ($bypass == 1)}' "$source" > "$tmp" ;;
+ resolutions)
+    jq --argjson mask "$modes" \
+       '.resolutions = [if ($mask % 2) == 1 then "1280x720" else empty end,
+                        if (($mask / 2 | floor) % 2) == 1 then "1920x1080" else empty end,
+                        if (($mask / 4 | floor) % 2) == 1 then "1280x960" else empty end]' "$source" > "$tmp" ;;
  diagnostics)
     jq --argjson enabled "$diagnostics" '.diagnostics = ($enabled == 1)' "$source" > "$tmp" ;;
  camera)
@@ -66,3 +77,11 @@ jq -e . "$tmp" >/dev/null
 mv -f "$tmp" "$config"
 mount -o remount,ro "$boot"
 trap - EXIT HUP INT TERM
+
+# A normal init-managed reboot releases all camera/ALSA/configfs resources and
+# re-enumerates USB using the new list. Never force reboot, and never reboot on
+# a failed save or failed read-only remount. Allow the UVC SET transfer to finish.
+if [ "$reboot_after_save" -eq 1 ]; then
+    sleep 1
+    exec /sbin/reboot
+fi
